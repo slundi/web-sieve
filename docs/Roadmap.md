@@ -69,7 +69,7 @@
 
 **Objective:** Leverage the Starlark + Rust pipeline to implement the primary structural use cases.
 
-### Step 4.1 — Ad-blocking & Global Style Injection
+### Step 4.1 — Ad-blocking & Global Style Injection ✅
 
 - Parse standard network blocking lists (EasyList, uBlock Origin) using a Trie/Prefix-tree engine.
 - Cosmetic filtering via `lol-html`: inject global `<style>` blocks to hide ad classes without breaking SPA hydration.

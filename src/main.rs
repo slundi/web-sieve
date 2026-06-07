@@ -10,6 +10,7 @@ use anyhow::Context;
 use bpaf::Bpaf;
 use tracing_subscriber::EnvFilter;
 use web_sieve::config::Config;
+use web_sieve::filter::AdBlockEngine;
 use web_sieve::proxy::ca::CertificateAuthority;
 use web_sieve::proxy::fingerprint::FingerprintProfiles;
 use web_sieve::proxy::tls::load_system_root_store;
@@ -34,6 +35,10 @@ struct Opts {
     /// Directory containing Starlark rule files (*.star).
     #[bpaf(long("rules-dir"), argument("PATH"), optional)]
     rules_dir: Option<PathBuf>,
+
+    /// Directory containing ad-block list files (*.txt in EasyList/uBlock format).
+    #[bpaf(long("lists-dir"), argument("PATH"), optional)]
+    lists_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -53,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         ca_cert_path: opts.ca_cert.unwrap_or(defaults.ca_cert_path),
         ca_key_path: opts.ca_key.unwrap_or(defaults.ca_key_path),
         rules_dir: opts.rules_dir.unwrap_or(defaults.rules_dir),
+        lists_dir: opts.lists_dir.unwrap_or(defaults.lists_dir),
     };
 
     tracing::info!("starting web-sieve proxy");
@@ -70,7 +76,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to initialise scripting engine")?;
 
-    web_sieve::proxy::run(config.bind_addr, ca, profiles, engine)
+    let blocker = AdBlockEngine::new(config.lists_dir.clone())
+        .await
+        .context("failed to initialise ad-block engine")?;
+
+    web_sieve::proxy::run(config.bind_addr, ca, profiles, engine, blocker)
         .await
         .context("proxy exited with error")?;
 

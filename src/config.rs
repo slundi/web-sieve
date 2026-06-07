@@ -23,6 +23,8 @@ pub struct Config {
     pub ca_key_path: PathBuf,
     /// Directory containing Starlark rule files (*.star).
     pub rules_dir: PathBuf,
+    /// Directory containing ad-block list files (*.txt in EasyList/uBlock format).
+    pub lists_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -35,6 +37,7 @@ impl Default for Config {
             ca_cert_path: config_dir.join("ca.crt"),
             ca_key_path: config_dir.join("ca.key"),
             rules_dir: config_dir.join("rules"),
+            lists_dir: config_dir.join("lists"),
         }
     }
 }
@@ -76,5 +79,12 @@ mod tests {
         let config = Config::default();
         assert!(config.rules_dir.to_string_lossy().contains("web-sieve"));
         assert!(config.rules_dir.ends_with("rules"));
+    }
+
+    #[test]
+    fn test_default_lists_dir() {
+        let config = Config::default();
+        assert!(config.lists_dir.to_string_lossy().contains("web-sieve"));
+        assert!(config.lists_dir.ends_with("lists"));
     }
 }

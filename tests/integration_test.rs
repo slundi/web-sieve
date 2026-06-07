@@ -11,6 +11,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use web_sieve::filter::AdBlockEngine;
 use web_sieve::proxy::ca::CertificateAuthority;
 use web_sieve::proxy::fingerprint::FingerprintProfiles;
 use web_sieve::proxy::tls::load_system_root_store;
@@ -67,6 +68,11 @@ async fn start_proxy() -> SocketAddr {
         .await
         .expect("scripting engine");
 
+    let lists_dir = dir.path().join("lists");
+    let blocker = AdBlockEngine::new(lists_dir)
+        .await
+        .expect("ad-block engine");
+
     // Keep tempdir alive for the duration of the test by leaking it.
     std::mem::forget(dir);
 
@@ -78,7 +84,7 @@ async fn start_proxy() -> SocketAddr {
     drop(listener);
 
     tokio::spawn(async move {
-        web_sieve::proxy::run(proxy_addr, ca, profiles, engine)
+        web_sieve::proxy::run(proxy_addr, ca, profiles, engine, blocker)
             .await
             .expect("proxy run");
     });
