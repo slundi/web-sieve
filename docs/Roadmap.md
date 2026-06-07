@@ -14,23 +14,23 @@
 - [x] Update `AGENT.md` to match project vision (architecture, module layout, knowledge base)
 - [ ] Enable Renovate Bot on Codeberg (`renovate.json` is ready)
 
-## Phase 1 — Core Network Infrastructure & MITM
+## Phase 1 — Core Network Infrastructure & MITM ✅
 
 **Objective:** Establish a high-throughput async local HTTP(S) proxy capable of decrypting secure traffic transparently.
 
-### Step 1.1 — Async TCP & HTTP Proxy Server
+### Step 1.1 — Async TCP & HTTP Proxy Server ✅
 
 - Set up the core networking stack using `tokio` and `hyper`.
 - Handle `CONNECT` requests for HTTPS tunneling.
 - Implement basic HTTP proxying (pass-through for non-intercepted hosts).
 
-### Step 1.2 — MITM & Certificate Authority
+### Step 1.2 — MITM & Certificate Authority ✅
 
 - Use `rcgen` to generate a persistent local Root CA certificate.
 - Generate leaf certificates on-the-fly per intercepted domain.
 - TLS termination and re-encryption via `tokio-rustls`.
 
-### Step 1.3 — Client Certificate Trust
+### Step 1.3 — Client Certificate Trust ✅
 
 - Document and script the process to install the Root CA into OS and browser trust stores (NSS store for Firefox/Chromium).
 
