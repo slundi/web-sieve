@@ -41,6 +41,20 @@ fn proxy_globals(builder: &mut GlobalsBuilder) {
         PENDING_OPS.with(|ops| ops.borrow_mut().push(RewriteOp::KeepOnly(selector)));
         Ok(NoneType)
     }
+
+    /// Switch the page to reader mode (extracts main article, replaces document).
+    fn enable_reader_mode() -> anyhow::Result<NoneType> {
+        PENDING_OPS.with(|ops| ops.borrow_mut().push(RewriteOp::ReaderMode));
+        Ok(NoneType)
+    }
+
+    /// Fire an HTTP POST webhook with `body` (JSON string). Side-effect only.
+    fn webhook(url: String, body: String) -> anyhow::Result<NoneType> {
+        PENDING_OPS.with(|ops| {
+            ops.borrow_mut().push(RewriteOp::Webhook { url, body });
+        });
+        Ok(NoneType)
+    }
 }
 
 // ─── Public types ───────────────────────────────────────────────────────────
@@ -318,6 +332,25 @@ def process(request):
         let ops = execute_rule(&rule.frozen, &ctx);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0], RewriteOp::RemoveElement("div.foo".into()));
+    }
+
+    #[test]
+    fn test_execute_rule_enable_reader_mode() {
+        let f = write_tempfile(
+            r#"
+def process(request):
+    enable_reader_mode()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+        let ctx = RequestCtx {
+            url: "http://example.com/".into(),
+            host: "example.com".into(),
+            content_type: "text/html".into(),
+        };
+        let ops = execute_rule(&rule.frozen, &ctx);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], RewriteOp::ReaderMode));
     }
 
     #[tokio::test]

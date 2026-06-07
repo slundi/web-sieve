@@ -6,5 +6,6 @@ pub mod config;
 pub mod error;
 pub mod filter;
 pub mod proxy;
+pub mod reader;
 pub mod rewriter;
 pub mod scripting;

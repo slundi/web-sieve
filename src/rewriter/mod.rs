@@ -15,6 +15,12 @@ pub enum RewriteOp {
     InjectStyle(String),
     /// Use CSS to hide all body children that do NOT match this selector.
     KeepOnly(String),
+    /// Invoke the readability engine to extract the main article, replacing the
+    /// entire document with a minimal reader-mode template.
+    ReaderMode,
+    /// Fire-and-forget HTTP POST webhook — sent as a side-effect; does not alter
+    /// the document.
+    Webhook { url: String, body: String },
 }
 
 /// Apply a sequence of [`RewriteOp`]s to an HTML document in a single streaming pass.
@@ -30,12 +36,34 @@ pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> 
         return Ok(html.to_vec());
     }
 
-    let mut output = Vec::with_capacity(html.len());
+    // 1. Fire webhooks (side-effects only, do not block on errors).
+    for op in ops {
+        if let RewriteOp::Webhook { url, body } = op
+            && let Err(e) = ureq::post(url)
+                .set("Content-Type", "application/json")
+                .send_string(body)
+        {
+            tracing::warn!(url = %url, error = %e, "webhook delivery failed");
+        }
+    }
+
+    // 2. Reader mode optionally replaces the entire document.
+    let reader_buf: Option<Vec<u8>> = if ops.iter().any(|o| matches!(o, RewriteOp::ReaderMode)) {
+        let html_str = String::from_utf8_lossy(html);
+        crate::reader::extract(&html_str).map(|a| crate::reader::render(&a))
+    } else {
+        None
+    };
+    let working: &[u8] = reader_buf.as_deref().unwrap_or(html);
+
+    // 3. Build lol-html element handlers (skip ReaderMode / Webhook).
+    let mut output = Vec::with_capacity(working.len());
     let mut element_handlers: Vec<(Cow<'static, Selector>, ElementContentHandlers<'_>)> =
         Vec::new();
 
     for op in ops {
         match op {
+            RewriteOp::ReaderMode | RewriteOp::Webhook { .. } => {}
             RewriteOp::RemoveElement(sel) => {
                 let selector: Selector = match sel.parse() {
                     Ok(s) => s,
@@ -88,6 +116,10 @@ pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> 
         }
     }
 
+    if element_handlers.is_empty() {
+        return Ok(working.to_vec());
+    }
+
     {
         let mut settings = Settings::new();
         for (selector, handler) in element_handlers {
@@ -98,7 +130,7 @@ pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> 
             output.extend_from_slice(chunk);
         });
 
-        rewriter.write(html)?;
+        rewriter.write(working)?;
         rewriter.end()?;
     }
 
@@ -150,6 +182,29 @@ mod tests {
         assert!(
             output.contains("display:none"),
             "keep_only should inject display:none css: {output}"
+        );
+    }
+
+    #[test]
+    fn test_reader_mode_extracts_article() {
+        let html = b"<html><head><title>My Post</title></head><body>\
+        <article class=\"content\">\
+        <h2>Hello</h2>\
+        <p>This is a substantial article body with enough text to pass the scoring threshold \
+        and be selected as the best candidate block by the readability algorithm.</p>\
+        </article>\
+        <aside class=\"sidebar\"><a href=\"/a\">a</a></aside>\
+        </body></html>";
+        let ops = vec![RewriteOp::ReaderMode];
+        let result = apply(&ops, html).expect("apply");
+        let output = String::from_utf8(result).expect("utf8");
+        assert!(
+            output.contains("<!DOCTYPE html>"),
+            "should be full reader template: {output}"
+        );
+        assert!(
+            output.contains("Hello"),
+            "article content should be present: {output}"
         );
     }
 }

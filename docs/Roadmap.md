@@ -74,11 +74,11 @@
 - Parse standard network blocking lists (EasyList, uBlock Origin) using a Trie/Prefix-tree engine.
 - Cosmetic filtering via `lol-html`: inject global `<style>` blocks to hide ad classes without breaking SPA hydration.
 
-### Step 4.2 — Universal Reader Mode
+### Step 4.2 — Universal Reader Mode ✅
 
-- Integrate a text-density extraction engine (Rust port of Mozilla Readability).
-- Wrap extracted content in a minimal, uniform HTML/CSS template.
-- Starlark hook to forward saved URLs to read-later services (Shiori, Pocket) via webhook.
+- [x] Integrate a text-density extraction engine (Rust port of Mozilla Readability).
+- [x] Wrap extracted content in a minimal, uniform HTML/CSS template.
+- [x] Starlark hook to forward saved URLs to read-later services (Shiori, Pocket) via webhook.
 
 ### Step 4.3 — Manga/Manhwa Pipeline & Image Proxying
 
