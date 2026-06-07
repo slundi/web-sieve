@@ -26,6 +26,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use crate::error::ProxyError;
 use crate::proxy::ca::CertificateAuthority;
 use crate::proxy::fingerprint::FingerprintProfiles;
+use crate::scripting::{RequestCtx, ScriptEngine};
 
 /// Shorthand body type used throughout the proxy.
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -52,6 +53,7 @@ pub async fn run(
     addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
     profiles: Arc<FingerprintProfiles>,
+    engine: Arc<ScriptEngine>,
 ) -> Result<(), ProxyError> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("proxy listening on {addr}");
@@ -62,9 +64,10 @@ pub async fn run(
 
         let ca = Arc::clone(&ca);
         let profiles = Arc::clone(&profiles);
+        let engine = Arc::clone(&engine);
 
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, ca, profiles).await {
+            if let Err(err) = handle_connection(stream, ca, profiles, engine).await {
                 tracing::warn!("connection error from {peer}: {err}");
             }
         });
@@ -76,6 +79,7 @@ async fn handle_connection(
     stream: TcpStream,
     ca: Arc<CertificateAuthority>,
     profiles: Arc<FingerprintProfiles>,
+    engine: Arc<ScriptEngine>,
 ) -> Result<(), ProxyError> {
     let io = TokioIo::new(stream);
     server_http1::Builder::new()
@@ -85,7 +89,8 @@ async fn handle_connection(
             service_fn(move |req| {
                 let ca = Arc::clone(&ca);
                 let profiles = Arc::clone(&profiles);
-                async move { proxy_request(req, ca, profiles).await }
+                let engine = Arc::clone(&engine);
+                async move { proxy_request(req, ca, profiles, engine).await }
             }),
         )
         .with_upgrades()
@@ -98,11 +103,12 @@ async fn proxy_request(
     req: Request<Incoming>,
     ca: Arc<CertificateAuthority>,
     profiles: Arc<FingerprintProfiles>,
+    engine: Arc<ScriptEngine>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     if req.method() == Method::CONNECT {
-        handle_connect(req, ca, profiles).await
+        handle_connect(req, ca, profiles, engine).await
     } else {
-        forward_http(req).await
+        forward_http(req, engine).await
     }
 }
 
@@ -114,6 +120,7 @@ async fn handle_connect(
     req: Request<Incoming>,
     ca: Arc<CertificateAuthority>,
     profiles: Arc<FingerprintProfiles>,
+    engine: Arc<ScriptEngine>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     let authority = req
         .uri()
@@ -141,7 +148,7 @@ async fn handle_connect(
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
-                if let Err(err) = do_mitm(upgraded, host, port, ca, profile_config).await {
+                if let Err(err) = do_mitm(upgraded, host, port, ca, profile_config, engine).await {
                     tracing::warn!("MITM error: {err}");
                 }
             }
@@ -166,6 +173,7 @@ async fn do_mitm(
     port: u16,
     ca: Arc<CertificateAuthority>,
     client_config: Arc<ClientConfig>,
+    engine: Arc<ScriptEngine>,
 ) -> Result<(), ProxyError> {
     // Accept the client's TLS handshake using a per-domain leaf cert.
     let server_cfg = ca.server_config(&host)?;
@@ -207,12 +215,15 @@ async fn do_mitm(
             TokioIo::new(client_tls),
             service_fn(move |req: Request<Incoming>| {
                 let sender = Arc::clone(&sender);
+                let engine = Arc::clone(&engine);
+                let host = host.clone();
                 async move {
-                    let (mut parts, body) = req.into_parts();
-                    headers::strip_hop_by_hop(&mut parts.headers);
+                    let (mut req_parts, body) = req.into_parts();
+                    headers::strip_hop_by_hop(&mut req_parts.headers);
                     let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
 
-                    let upstream_req = Request::from_parts(parts, full_body(body_bytes));
+                    let upstream_req =
+                        Request::from_parts(req_parts.clone(), full_body(body_bytes));
 
                     let resp = {
                         let mut s = sender.lock().await;
@@ -229,7 +240,41 @@ async fn do_mitm(
                         .map_err(ProxyError::Http)?
                         .to_bytes();
 
-                    Ok::<_, ProxyError>(Response::from_parts(resp_parts, full_body(resp_bytes)))
+                    // Apply scripting rules to HTML responses.
+                    let is_html = resp_parts
+                        .headers
+                        .get(hyper::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|ct| ct.contains("text/html"))
+                        .unwrap_or(false);
+
+                    let final_bytes = if is_html {
+                        let url = format!("https://{host}{}", req_parts.uri);
+                        let ctx = RequestCtx {
+                            url,
+                            host: host.clone(),
+                            content_type: "text/html".to_string(),
+                        };
+                        let engine = Arc::clone(&engine);
+                        let raw: bytes::Bytes = resp_bytes;
+                        tokio::task::spawn_blocking(move || {
+                            let ops = engine.run_rules(&ctx);
+                            if ops.is_empty() {
+                                raw
+                            } else {
+                                crate::rewriter::apply(&ops, &raw)
+                                    .map(bytes::Bytes::from)
+                                    .unwrap_or(raw)
+                            }
+                        })
+                        .await
+                        .map_err(|e| ProxyError::Scripting(e.to_string()))?
+                    } else {
+                        resp_bytes
+                    };
+
+                    resp_parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                    Ok::<_, ProxyError>(Response::from_parts(resp_parts, full_body(final_bytes)))
                 }
             }),
         )
@@ -240,7 +285,11 @@ async fn do_mitm(
 /// Forward a plain HTTP request to its destination.
 ///
 /// Strips hop-by-hop headers before forwarding and from the upstream response.
-async fn forward_http(req: Request<Incoming>) -> Result<Response<BoxBody>, ProxyError> {
+/// HTML responses are passed through the scripting engine before being returned.
+async fn forward_http(
+    req: Request<Incoming>,
+    engine: Arc<ScriptEngine>,
+) -> Result<Response<BoxBody>, ProxyError> {
     let uri = req.uri().clone();
     let host = uri
         .host()
@@ -280,7 +329,39 @@ async fn forward_http(req: Request<Incoming>) -> Result<Response<BoxBody>, Proxy
         .map_err(ProxyError::Http)?
         .to_bytes();
 
-    Ok(Response::from_parts(resp_parts, full_body(resp_bytes)))
+    // Apply scripting rules to HTML responses.
+    let is_html = resp_parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/html"))
+        .unwrap_or(false);
+
+    let final_bytes = if is_html {
+        let ctx = RequestCtx {
+            url: uri.to_string(),
+            host: host.clone(),
+            content_type: "text/html".to_string(),
+        };
+        let raw = resp_bytes;
+        tokio::task::spawn_blocking(move || {
+            let ops = engine.run_rules(&ctx);
+            if ops.is_empty() {
+                raw
+            } else {
+                crate::rewriter::apply(&ops, &raw)
+                    .map(bytes::Bytes::from)
+                    .unwrap_or(raw)
+            }
+        })
+        .await
+        .map_err(|e| ProxyError::Scripting(e.to_string()))?
+    } else {
+        resp_bytes
+    };
+
+    resp_parts.headers.remove(hyper::header::CONTENT_LENGTH);
+    Ok(Response::from_parts(resp_parts, full_body(final_bytes)))
 }
 
 #[cfg(test)]

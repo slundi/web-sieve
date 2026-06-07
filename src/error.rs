@@ -32,6 +32,14 @@ pub enum ProxyError {
     /// The system root certificate store could not be loaded.
     #[error("failed to load system root certificates: {0}")]
     RootCerts(String),
+
+    /// A scripting engine error.
+    #[error("scripting error: {0}")]
+    Scripting(String),
+
+    /// An HTML rewriting error.
+    #[error("rewriting error: {0}")]
+    Rewriting(String),
 }
 
 #[cfg(test)]
@@ -51,5 +59,17 @@ mod tests {
     fn test_proxy_error_display_invalid_authority() {
         let err = ProxyError::InvalidAuthority("bad:host:port".to_string());
         assert!(err.to_string().contains("invalid CONNECT authority"));
+    }
+
+    #[test]
+    fn test_proxy_error_display_scripting() {
+        let err = ProxyError::Scripting("eval failed".to_string());
+        assert!(err.to_string().contains("scripting error"));
+    }
+
+    #[test]
+    fn test_proxy_error_display_rewriting() {
+        let err = ProxyError::Rewriting("selector error".to_string());
+        assert!(err.to_string().contains("rewriting error"));
     }
 }

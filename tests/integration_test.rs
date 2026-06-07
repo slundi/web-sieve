@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use web_sieve::proxy::ca::CertificateAuthority;
 use web_sieve::proxy::fingerprint::FingerprintProfiles;
 use web_sieve::proxy::tls::load_system_root_store;
+use web_sieve::scripting::ScriptEngine;
 
 /// Start a minimal HTTP echo server and return its bound address.
 async fn start_echo_server() -> SocketAddr {
@@ -60,6 +61,12 @@ async fn start_proxy() -> SocketAddr {
         &dir.path().join("ca.key"),
     )
     .expect("CA");
+
+    let rules_dir = dir.path().join("rules");
+    let engine = ScriptEngine::new(rules_dir)
+        .await
+        .expect("scripting engine");
+
     // Keep tempdir alive for the duration of the test by leaking it.
     std::mem::forget(dir);
 
@@ -71,7 +78,7 @@ async fn start_proxy() -> SocketAddr {
     drop(listener);
 
     tokio::spawn(async move {
-        web_sieve::proxy::run(proxy_addr, ca, profiles)
+        web_sieve::proxy::run(proxy_addr, ca, profiles, engine)
             .await
             .expect("proxy run");
     });

@@ -21,6 +21,8 @@ pub struct Config {
     pub ca_cert_path: PathBuf,
     /// Path to the root CA private key PEM file.
     pub ca_key_path: PathBuf,
+    /// Directory containing Starlark rule files (*.star).
+    pub rules_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -32,6 +34,7 @@ impl Default for Config {
                 .expect("hard-coded address is valid"),
             ca_cert_path: config_dir.join("ca.crt"),
             ca_key_path: config_dir.join("ca.key"),
+            rules_dir: config_dir.join("rules"),
         }
     }
 }
@@ -66,5 +69,12 @@ mod tests {
         assert!(config.ca_cert_path.to_string_lossy().contains("web-sieve"));
         assert!(config.ca_cert_path.file_name().unwrap() == "ca.crt");
         assert!(config.ca_key_path.file_name().unwrap() == "ca.key");
+    }
+
+    #[test]
+    fn test_default_rules_dir() {
+        let config = Config::default();
+        assert!(config.rules_dir.to_string_lossy().contains("web-sieve"));
+        assert!(config.rules_dir.ends_with("rules"));
     }
 }

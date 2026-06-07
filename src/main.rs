@@ -13,6 +13,7 @@ use web_sieve::config::Config;
 use web_sieve::proxy::ca::CertificateAuthority;
 use web_sieve::proxy::fingerprint::FingerprintProfiles;
 use web_sieve::proxy::tls::load_system_root_store;
+use web_sieve::scripting::ScriptEngine;
 
 /// Command-line options for the web-sieve proxy.
 #[derive(Debug, Clone, Bpaf)]
@@ -29,6 +30,10 @@ struct Opts {
     /// Path to the root CA private key PEM file.
     #[bpaf(long("ca-key"), argument("PATH"), optional)]
     ca_key: Option<PathBuf>,
+
+    /// Directory containing Starlark rule files (*.star).
+    #[bpaf(long("rules-dir"), argument("PATH"), optional)]
+    rules_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -47,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         bind_addr: opts.bind.unwrap_or(defaults.bind_addr),
         ca_cert_path: opts.ca_cert.unwrap_or(defaults.ca_cert_path),
         ca_key_path: opts.ca_key.unwrap_or(defaults.ca_key_path),
+        rules_dir: opts.rules_dir.unwrap_or(defaults.rules_dir),
     };
 
     tracing::info!("starting web-sieve proxy");
@@ -60,7 +66,11 @@ async fn main() -> anyhow::Result<()> {
         FingerprintProfiles::new(root_store).context("failed to build fingerprint profiles")?,
     );
 
-    web_sieve::proxy::run(config.bind_addr, ca, profiles)
+    let engine = ScriptEngine::new(config.rules_dir.clone())
+        .await
+        .context("failed to initialise scripting engine")?;
+
+    web_sieve::proxy::run(config.bind_addr, ca, profiles, engine)
         .await
         .context("proxy exited with error")?;
 

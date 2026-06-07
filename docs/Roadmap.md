@@ -47,21 +47,21 @@
 
 - Transparent forwarding of upstream headers, session cookies, and state to guarantee seamless authentication on intercepted sites.
 
-## Phase 3 — Starlark Scripting Engine & HTML Pipeline
+## Phase 3 — Starlark Scripting Engine & HTML Pipeline ✅
 
 **Objective:** Embed a scripting engine and build a low-latency streaming HTML modification pipeline.
 
-### Step 3.1 — Starlark Integration
+### Step 3.1 — Starlark Integration ✅
 
 - Embed `starlark-rust` into the proxy core.
 - Define Rust-to-Starlark bindings exposing request URL, response headers, and HTML context wrappers.
 
-### Step 3.2 — Streaming HTML Parsing via lol-html
+### Step 3.2 — Streaming HTML Parsing via lol-html ✅
 
 - Integrate `lol-html` for low-overhead, byte-stream HTML rewriting.
 - Expose safe macro-operations to Starlark scripts: `remove_element()`, `keep_only()`, `inject_style()`, etc.
 
-### Step 3.3 — Dynamic Script Hot-Reloading
+### Step 3.3 — Dynamic Script Hot-Reloading ✅
 
 - Use the `notify` crate to watch rule files and reload Starlark scripts on modification without restarting the proxy.
 
