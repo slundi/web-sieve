@@ -5,4 +5,4 @@ let
   flake = builtins.getFlake (toString ./.);
   system = builtins.currentSystem;
 in
-  flake.devShells.${system}.default
+flake.devShells.${system}.default

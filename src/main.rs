@@ -11,7 +11,8 @@ use bpaf::Bpaf;
 use tracing_subscriber::EnvFilter;
 use web_sieve::config::Config;
 use web_sieve::proxy::ca::CertificateAuthority;
-use web_sieve::proxy::tls::make_client_config;
+use web_sieve::proxy::fingerprint::FingerprintProfiles;
+use web_sieve::proxy::tls::load_system_root_store;
 
 /// Command-line options for the web-sieve proxy.
 #[derive(Debug, Clone, Bpaf)]
@@ -54,14 +55,12 @@ async fn main() -> anyhow::Result<()> {
     let ca = CertificateAuthority::load_or_create(&config.ca_cert_path, &config.ca_key_path)
         .context("failed to initialise certificate authority")?;
 
-    let client_config = Arc::new(
-        make_client_config()
-            .context("failed to build TLS client configuration")?
-            .as_ref()
-            .clone(),
+    let root_store = load_system_root_store();
+    let profiles = Arc::new(
+        FingerprintProfiles::new(root_store).context("failed to build fingerprint profiles")?,
     );
 
-    web_sieve::proxy::run(config.bind_addr, ca, client_config)
+    web_sieve::proxy::run(config.bind_addr, ca, profiles)
         .await
         .context("proxy exited with error")?;
 

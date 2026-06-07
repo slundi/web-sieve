@@ -34,16 +34,16 @@
 
 - Document and script the process to install the Root CA into OS and browser trust stores (NSS store for Firefox/Chromium).
 
-## Phase 2 — Stealth & Anti-Bot Evasion
+## Phase 2 — Stealth & Anti-Bot Evasion ✅
 
 **Objective:** Prevent upstream security systems (Cloudflare, Akamai) from fingerprinting and blocking the proxy.
 
-### Step 2.1 — TLS Fingerprint Spoofing (JA3/JA4)
+### Step 2.1 — TLS Fingerprint Spoofing (JA3/JA4) ✅
 
 - Replace the standard TLS backend for outgoing connections with one that can mimic browser handshakes.
 - Match the outgoing TLS signature to the user's active browser `User-Agent`.
 
-### Step 2.2 — Header & Cookie Forwarding
+### Step 2.2 — Header & Cookie Forwarding ✅
 
 - Transparent forwarding of upstream headers, session cookies, and state to guarantee seamless authentication on intercepted sites.
 

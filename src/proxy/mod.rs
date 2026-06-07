@@ -1,6 +1,8 @@
 //! Core MITM proxy server: accept loop, CONNECT handling, and HTTP forwarding.
 
 pub mod ca;
+pub mod fingerprint;
+pub mod headers;
 pub mod tls;
 
 use std::net::SocketAddr;
@@ -23,6 +25,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::error::ProxyError;
 use crate::proxy::ca::CertificateAuthority;
+use crate::proxy::fingerprint::FingerprintProfiles;
 
 /// Shorthand body type used throughout the proxy.
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -48,7 +51,7 @@ fn full_body(data: impl Into<Bytes>) -> BoxBody {
 pub async fn run(
     addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
-    client_config: Arc<ClientConfig>,
+    profiles: Arc<FingerprintProfiles>,
 ) -> Result<(), ProxyError> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("proxy listening on {addr}");
@@ -58,10 +61,10 @@ pub async fn run(
         tracing::debug!("accepted connection from {peer}");
 
         let ca = Arc::clone(&ca);
-        let cc = Arc::clone(&client_config);
+        let profiles = Arc::clone(&profiles);
 
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, ca, cc).await {
+            if let Err(err) = handle_connection(stream, ca, profiles).await {
                 tracing::warn!("connection error from {peer}: {err}");
             }
         });
@@ -72,7 +75,7 @@ pub async fn run(
 async fn handle_connection(
     stream: TcpStream,
     ca: Arc<CertificateAuthority>,
-    client_config: Arc<ClientConfig>,
+    profiles: Arc<FingerprintProfiles>,
 ) -> Result<(), ProxyError> {
     let io = TokioIo::new(stream);
     server_http1::Builder::new()
@@ -81,8 +84,8 @@ async fn handle_connection(
             io,
             service_fn(move |req| {
                 let ca = Arc::clone(&ca);
-                let cc = Arc::clone(&client_config);
-                async move { proxy_request(req, ca, cc).await }
+                let profiles = Arc::clone(&profiles);
+                async move { proxy_request(req, ca, profiles).await }
             }),
         )
         .with_upgrades()
@@ -94,10 +97,10 @@ async fn handle_connection(
 async fn proxy_request(
     req: Request<Incoming>,
     ca: Arc<CertificateAuthority>,
-    client_config: Arc<ClientConfig>,
+    profiles: Arc<FingerprintProfiles>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     if req.method() == Method::CONNECT {
-        handle_connect(req, ca, client_config).await
+        handle_connect(req, ca, profiles).await
     } else {
         forward_http(req).await
     }
@@ -110,7 +113,7 @@ async fn proxy_request(
 async fn handle_connect(
     req: Request<Incoming>,
     ca: Arc<CertificateAuthority>,
-    client_config: Arc<ClientConfig>,
+    profiles: Arc<FingerprintProfiles>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     let authority = req
         .uri()
@@ -121,12 +124,24 @@ async fn handle_connect(
     let host = authority.host().to_string();
     let port = authority.port_u16().unwrap_or(443);
 
+    // Select the browser TLS fingerprint profile from the User-Agent header.
+    let ua = req
+        .headers()
+        .get(hyper::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let browser = fingerprint::Browser::from_user_agent(&ua);
+    let (ja3_string, ja3_hash) = fingerprint::ja3_for_browser(browser);
+    tracing::debug!(%host, ?browser, ja3 = %ja3_hash, ja3_raw = %ja3_string, "CONNECT: selected fingerprint profile");
+    let profile_config = profiles.config_for(browser);
+
     let upgrade = hyper::upgrade::on(req);
 
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
-                if let Err(err) = do_mitm(upgraded, host, port, ca, client_config).await {
+                if let Err(err) = do_mitm(upgraded, host, port, ca, profile_config).await {
                     tracing::warn!("MITM error: {err}");
                 }
             }
@@ -143,7 +158,8 @@ async fn handle_connect(
 /// Perform MITM interception on an upgraded connection.
 ///
 /// Accepts the client TLS handshake using a domain-specific leaf certificate,
-/// then connects to the upstream server and forwards each HTTP request.
+/// then connects to the upstream server using the browser-matched TLS profile
+/// and forwards each HTTP request.
 async fn do_mitm(
     upgraded: hyper::upgrade::Upgraded,
     host: String,
@@ -192,7 +208,8 @@ async fn do_mitm(
             service_fn(move |req: Request<Incoming>| {
                 let sender = Arc::clone(&sender);
                 async move {
-                    let (parts, body) = req.into_parts();
+                    let (mut parts, body) = req.into_parts();
+                    headers::strip_hop_by_hop(&mut parts.headers);
                     let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
 
                     let upstream_req = Request::from_parts(parts, full_body(body_bytes));
@@ -204,10 +221,15 @@ async fn do_mitm(
                             .map_err(ProxyError::Http)?
                     };
 
-                    let (parts, body) = resp.into_parts();
-                    let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
+                    let (mut resp_parts, resp_body) = resp.into_parts();
+                    headers::strip_hop_by_hop(&mut resp_parts.headers);
+                    let resp_bytes = resp_body
+                        .collect()
+                        .await
+                        .map_err(ProxyError::Http)?
+                        .to_bytes();
 
-                    Ok::<_, ProxyError>(Response::from_parts(parts, full_body(body_bytes)))
+                    Ok::<_, ProxyError>(Response::from_parts(resp_parts, full_body(resp_bytes)))
                 }
             }),
         )
@@ -217,7 +239,7 @@ async fn do_mitm(
 
 /// Forward a plain HTTP request to its destination.
 ///
-/// Strips the `Proxy-Connection` header before forwarding.
+/// Strips hop-by-hop headers before forwarding and from the upstream response.
 async fn forward_http(req: Request<Incoming>) -> Result<Response<BoxBody>, ProxyError> {
     let uri = req.uri().clone();
     let host = uri
@@ -228,8 +250,8 @@ async fn forward_http(req: Request<Incoming>) -> Result<Response<BoxBody>, Proxy
 
     let (mut parts, body) = req.into_parts();
 
-    // Strip proxy-specific headers.
-    parts.headers.remove("proxy-connection");
+    // Strip all hop-by-hop headers (including proxy-connection).
+    headers::strip_hop_by_hop(&mut parts.headers);
 
     let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
 
@@ -250,10 +272,15 @@ async fn forward_http(req: Request<Incoming>) -> Result<Response<BoxBody>, Proxy
         .await
         .map_err(ProxyError::Http)?;
 
-    let (parts, body) = resp.into_parts();
-    let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
+    let (mut resp_parts, resp_body) = resp.into_parts();
+    headers::strip_hop_by_hop(&mut resp_parts.headers);
+    let resp_bytes = resp_body
+        .collect()
+        .await
+        .map_err(ProxyError::Http)?
+        .to_bytes();
 
-    Ok(Response::from_parts(parts, full_body(body_bytes)))
+    Ok(Response::from_parts(resp_parts, full_body(resp_bytes)))
 }
 
 #[cfg(test)]

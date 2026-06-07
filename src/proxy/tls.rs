@@ -16,27 +16,21 @@ const SYSTEM_CERT_PATHS: &[&str] = &[
     "/etc/ssl/cert.pem",
 ];
 
-/// Build a [`ClientConfig`] that trusts system root certificates.
+/// Build a [`RootCertStore`] from the first available system cert bundle.
 ///
-/// The function tries each path in [`SYSTEM_CERT_PATHS`] in order and loads
-/// the first file that exists.  If no file is found, a warning is logged and
-/// an empty root store is used (most upstream TLS connections will then fail
-/// certificate verification).
-///
-/// # Errors
-///
-/// Returns a [`ProxyError`] if the [`ClientConfig`] cannot be constructed.
-pub fn make_client_config() -> Result<Arc<ClientConfig>, ProxyError> {
+/// Tries each path in [`SYSTEM_CERT_PATHS`] in order and loads the first
+/// file that exists.  If no file is found, a warning is logged and an empty
+/// store is returned (most upstream TLS connections will then fail certificate
+/// verification).
+pub fn load_system_root_store() -> RootCertStore {
     let mut root_store = RootCertStore::empty();
 
-    let mut loaded = false;
     for path in SYSTEM_CERT_PATHS {
         if std::path::Path::new(path).exists() {
             match load_certs_from_file(path, &mut root_store) {
                 Ok(count) => {
                     tracing::debug!("loaded {count} root certificates from {path}");
-                    loaded = true;
-                    break;
+                    return root_store;
                 }
                 Err(err) => {
                     tracing::warn!("failed to load root certs from {path}: {err}");
@@ -45,11 +39,20 @@ pub fn make_client_config() -> Result<Arc<ClientConfig>, ProxyError> {
         }
     }
 
-    if !loaded {
-        tracing::warn!(
-            "no system root certificate store found; upstream TLS verification will fail"
-        );
-    }
+    tracing::warn!("no system root certificate store found; upstream TLS verification will fail");
+    root_store
+}
+
+/// Build a [`ClientConfig`] that trusts system root certificates.
+///
+/// This is a thin wrapper around [`load_system_root_store`] that builds a
+/// default (non-fingerprinted) TLS client config for backward compatibility.
+///
+/// # Errors
+///
+/// Returns a [`ProxyError`] if the [`ClientConfig`] cannot be constructed.
+pub fn make_client_config() -> Result<Arc<ClientConfig>, ProxyError> {
+    let root_store = load_system_root_store();
 
     let config = ClientConfig::builder()
         .with_root_certificates(root_store)
@@ -92,5 +95,11 @@ mod tests {
         let config = make_client_config().unwrap();
         // Verify we can clone the Arc without issues.
         let _clone = Arc::clone(&config);
+    }
+
+    #[test]
+    fn test_load_system_root_store_returns_store() {
+        // Should always return a RootCertStore (empty or populated).
+        let _store = load_system_root_store();
     }
 }

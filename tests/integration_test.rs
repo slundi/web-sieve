@@ -12,7 +12,8 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use web_sieve::proxy::ca::CertificateAuthority;
-use web_sieve::proxy::tls::make_client_config;
+use web_sieve::proxy::fingerprint::FingerprintProfiles;
+use web_sieve::proxy::tls::load_system_root_store;
 
 /// Start a minimal HTTP echo server and return its bound address.
 async fn start_echo_server() -> SocketAddr {
@@ -62,19 +63,15 @@ async fn start_proxy() -> SocketAddr {
     // Keep tempdir alive for the duration of the test by leaking it.
     std::mem::forget(dir);
 
-    let client_config = Arc::new(
-        make_client_config()
-            .expect("client config")
-            .as_ref()
-            .clone(),
-    );
+    let root_store = load_system_root_store();
+    let profiles = Arc::new(FingerprintProfiles::new(root_store).expect("fingerprint profiles"));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
     let proxy_addr = listener.local_addr().expect("local addr");
     drop(listener);
 
     tokio::spawn(async move {
-        web_sieve::proxy::run(proxy_addr, ca, client_config)
+        web_sieve::proxy::run(proxy_addr, ca, profiles)
             .await
             .expect("proxy run");
     });
