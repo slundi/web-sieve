@@ -1,0 +1,103 @@
+[package]
+name = "web-sieve"
+version = "0.1.0"
+authors = ["Sébastien LUNDI"]
+categories = ["network-programming", "web-programming"]
+edition = "2024" # requires Rust >= 1.85 (stable as of Feb 2025)
+keywords = ["proxy", "mitm", "starlark", "adblock", "content-filtering"]
+license = "GPL-3.0-only"
+readme = "README.md"
+repository = "https://codeberg.org/slundi/web-sieve"
+description = "Programmable HTTPS MITM proxy that sanitizes, filters, and rewrites web content via Starlark scripts"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "web_sieve"
+path = "src/lib.rs"
+
+[[bin]]
+name = "web-sieve"
+path = "src/main.rs"
+
+[package.metadata.docs.rs]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  # "x86_64-apple-darwin",
+  # "x86_64-pc-windows-msvc",
+  # "i686-unknown-linux-gnu",
+  # "i686-pc-windows-msvc"
+]
+
+[dependencies]
+aho-corasick = "1.1.4"
+anyhow = "1.0.102"
+bpaf = "0.9.26"
+bytes = "1.11.1"
+hyper = { version = "1.10.1", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["full"] }
+lol_html = "3.0.0"
+notify = "8.2.0"
+rcgen = "0.14.8"
+rustls = "0.23.40"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-rustls = "0.26.4"
+tower = "0.5.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "bench"
+harness = false
+
+[[example]]
+name = "basic"
+
+[package.metadata.cargo-machete]
+ignored = []
+
+# --- Profiles ---
+
+# Standard Dev Profile (Optimized for speed of compilation)
+[profile.dev]
+opt-level = 0
+debug = true
+
+# Production Release Profile
+# This ensures the Nix-built binary is highly optimized
+[profile.release]
+opt-level = 3 # Max optimizations
+lto = "fat" # Link Time Optimization (smaller, faster binary)
+codegen-units = 1 # Better optimizations at the cost of compile time
+panic = "abort" # Removes stack unwinding (smaller binary size)
+strip = true # Automatically strips symbols/debug info (like 'strip' command)
+
+# Profile for Benchmarking
+[profile.bench]
+extend = "release"
+debug = false
+
+# --- Features ---
+# [features]
+# default = []
+# async = ["dep:tokio"] # must be in dependencies
+
+# --- cargo-dist ---
+# Run `cargo dist init` to generate full CI integration.
+# This project uses its own release workflow (.github/workflows/release.yaml);
+# set dist = true here only if you want cargo-dist to manage releases instead.
+[workspace.metadata.dist]
+dist = false
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
