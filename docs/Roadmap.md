@@ -121,3 +121,25 @@
 - Target: less than 15 ms added latency overhead.
 - Ensure large binary assets (images, video streams) bypass the heavy processing pipeline entirely.
 - Profile memory mapping and async task scheduling; optimise only after profiling.
+
+### Step 6.3 — HTTP/2 Browser↔Proxy Protocol
+
+- HTTP/2 on the browser→proxy leg only (`hyper`); proxy→upstream remains independent.
+- Advertise `h2` in ALPN on the listening `tokio-rustls` socket; negotiate HTTP/1.1 as fallback.
+- Each concurrent HTTP/2 stream is dispatched as its own `tokio` task; `lol-html` rewriting runs per-stream in parallel.
+
+### Step 6.4 — Minijinja Template Engine
+
+- Users author display templates in the XDG data directory under `templates/` using `minijinja`.
+- Covers re-rendered views: torrent/download list, weather forecast, news feed, manga/webnovel reader, git repository.
+- Starlark scripts call `render_template(name, context_dict)` binding; Rust resolves the template name and renders via `minijinja`.
+- Templates are shared: multiple Starlark scripts may reference the same template by name.
+- Extend the existing `notify` file watcher to hot-reload templates on modification.
+
+### Step 6.5 — Static Asset Serving & Local Proxy Endpoint
+
+- Proxy intercepts requests to `webprism.local` by hostname match — no DNS or `/etc/hosts` entry required.
+- Assets (`css`, `js`, `fonts`, `scripts`, `templates`) live in the XDG data directory so users can add or override files.
+- Prefer inlining assets into templates to avoid extra round-trips; the XDG directory is also served for files that cannot be inlined.
+- Extend the `notify` watcher to cover the full XDG asset directory.
+- CORS: default same-origin (`webprism.local` only); configurable `Access-Control-Allow-Origin` allowlist for cross-origin use.
