@@ -27,6 +27,10 @@ pub struct Config {
     pub lists_dir: PathBuf,
     /// Directory containing content-scanner dictionary files (*.txt, one term per line).
     pub dicts_dir: PathBuf,
+    /// Density threshold for semantic blocking: hits-per-byte ratio above which
+    /// a Starlark rule may call `block_page()`.  Exposed to scripts via
+    /// `density_threshold()`.  Default: `0.01` (1 hit per 100 bytes).
+    pub density_threshold: f32,
 }
 
 impl Default for Config {
@@ -41,6 +45,7 @@ impl Default for Config {
             rules_dir: config_dir.join("rules"),
             lists_dir: config_dir.join("lists"),
             dicts_dir: config_dir.join("dicts"),
+            density_threshold: 0.01,
         }
     }
 }
@@ -96,5 +101,11 @@ mod tests {
         let config = Config::default();
         assert!(config.dicts_dir.to_string_lossy().contains("web-sieve"));
         assert!(config.dicts_dir.ends_with("dicts"));
+    }
+
+    #[test]
+    fn test_default_density_threshold() {
+        let config = Config::default();
+        assert!((config.density_threshold - 0.01_f32).abs() < f32::EPSILON);
     }
 }

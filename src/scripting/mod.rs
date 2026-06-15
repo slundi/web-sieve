@@ -23,6 +23,8 @@ thread_local! {
     /// Scan context set once per `execute_rule` call and read by `scan_matches()`
     /// and `scan_content_length()` from within the Starlark process() function.
     static SCAN_CTX: RefCell<(Vec<ScanMatch>, usize)> = const { RefCell::new((Vec::new(), 0)) };
+    /// Configured density threshold, set per `run_rules` call.
+    static DENSITY_THRESHOLD: RefCell<f32> = const { RefCell::new(0.01) };
 }
 
 // ─── Starlark global functions ──────────────────────────────────────────────
@@ -101,6 +103,23 @@ fn proxy_globals(builder: &mut GlobalsBuilder) {
     fn scan_content_length() -> anyhow::Result<i64> {
         Ok(SCAN_CTX.with(|ctx| ctx.borrow().1 as i64))
     }
+
+    /// Return the configured hits-per-byte density threshold.
+    ///
+    /// Use this instead of a hard-coded literal so the threshold can be set
+    /// globally via `--density-threshold` without editing each rule file.
+    ///
+    /// Example:
+    /// ```python
+    /// def process(request):
+    ///     m = scan_matches()
+    ///     n = scan_content_length()
+    ///     if n > 0 and m.get("violence", 0) / n > density_threshold():
+    ///         block_page()
+    /// ```
+    fn density_threshold() -> anyhow::Result<f64> {
+        Ok(DENSITY_THRESHOLD.with(|t| *t.borrow() as f64))
+    }
 }
 
 // ─── Public types ───────────────────────────────────────────────────────────
@@ -131,6 +150,7 @@ struct LoadedRule {
 pub struct ScriptEngine {
     rules: Arc<RwLock<Vec<LoadedRule>>>,
     rules_dir: PathBuf,
+    density_threshold: f32,
     _watcher: Box<dyn notify::Watcher + Send + Sync>,
 }
 
@@ -145,7 +165,7 @@ impl ScriptEngine {
     ///
     /// Returns an error if the directory cannot be created, a file watcher
     /// cannot be set up, or the initial rule compilation fails fatally.
-    pub async fn new(rules_dir: PathBuf) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(rules_dir: PathBuf, density_threshold: f32) -> anyhow::Result<Arc<Self>> {
         use notify::{RecursiveMode, Watcher, recommended_watcher};
         use tokio::sync::mpsc;
 
@@ -190,6 +210,7 @@ impl ScriptEngine {
         let engine = Arc::new(ScriptEngine {
             rules,
             rules_dir,
+            density_threshold,
             _watcher: Box::new(watcher),
         });
 
@@ -201,11 +222,13 @@ impl ScriptEngine {
     /// This method is synchronous and may be called from a `spawn_blocking` context.
     pub fn run_rules(&self, ctx: &RequestCtx) -> Vec<RewriteOp> {
         let rules = self.rules.blocking_read();
+        DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = self.density_threshold);
         let mut all_ops = Vec::new();
         for rule in rules.iter() {
             let ops = execute_rule(&rule.frozen, ctx);
             all_ops.extend(ops);
         }
+        DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = 0.01_f32);
         all_ops
     }
 
@@ -508,13 +531,34 @@ def process(request):
         assert!(matches!(ops[0], RewriteOp::BlockPage));
     }
 
+    #[test]
+    fn test_execute_rule_density_threshold_function() {
+        let f = write_tempfile(
+            r#"
+def process(request):
+    t = density_threshold()
+    if t > 0.005:
+        block_page()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        // Set the thread-local to 0.02 to simulate a custom CLI threshold.
+        DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = 0.02_f32);
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
+        DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = 0.01_f32);
+
+        assert_eq!(ops.len(), 1, "threshold 0.02 > 0.005 → block_page: {ops:?}");
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
+    }
+
     #[tokio::test]
     async fn test_script_engine_new_creates_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let rules_dir = tmp.path().join("rules");
         assert!(!rules_dir.exists());
 
-        let engine = ScriptEngine::new(rules_dir.clone())
+        let engine = ScriptEngine::new(rules_dir.clone(), 0.01)
             .await
             .expect("ScriptEngine::new");
         assert!(rules_dir.exists(), "rules dir should be created");

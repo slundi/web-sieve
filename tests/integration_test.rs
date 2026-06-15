@@ -65,7 +65,7 @@ async fn start_proxy() -> SocketAddr {
     .expect("CA");
 
     let rules_dir = dir.path().join("rules");
-    let engine = ScriptEngine::new(rules_dir)
+    let engine = ScriptEngine::new(rules_dir, 0.01)
         .await
         .expect("scripting engine");
 

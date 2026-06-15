@@ -44,6 +44,11 @@ struct Opts {
     /// Directory containing content-scanner dictionary files (*.txt, one term per line).
     #[bpaf(long("dicts-dir"), argument("PATH"), optional)]
     dicts_dir: Option<PathBuf>,
+
+    /// Hits-per-byte density threshold for semantic blocking rules (default: 0.01).
+    /// Starlark scripts read this via `density_threshold()` instead of hard-coding a value.
+    #[bpaf(long("density-threshold"), argument("FLOAT"), optional)]
+    density_threshold: Option<f32>,
 }
 
 #[tokio::main]
@@ -65,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
         rules_dir: opts.rules_dir.unwrap_or(defaults.rules_dir),
         lists_dir: opts.lists_dir.unwrap_or(defaults.lists_dir),
         dicts_dir: opts.dicts_dir.unwrap_or(defaults.dicts_dir),
+        density_threshold: opts.density_threshold.unwrap_or(defaults.density_threshold),
     };
 
     tracing::info!("starting web-sieve proxy");
@@ -78,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
         FingerprintProfiles::new(root_store).context("failed to build fingerprint profiles")?,
     );
 
-    let engine = ScriptEngine::new(config.rules_dir.clone())
+    let engine = ScriptEngine::new(config.rules_dir.clone(), config.density_threshold)
         .await
         .context("failed to initialise scripting engine")?;
 
