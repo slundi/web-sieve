@@ -94,7 +94,7 @@
 
 **Objective:** Deep semantic inspection for parental controls and anti-phishing.
 
-### Step 5.1 — High-Speed Text Scanning
+### Step 5.1 — High-Speed Text Scanning ✅
 
 - `aho-corasick` multi-pattern search on raw text payloads against configurable dictionary matrices.
 
@@ -143,3 +143,9 @@
 - Prefer inlining assets into templates to avoid extra round-trips; the XDG directory is also served for files that cannot be inlined.
 - Extend the `notify` watcher to cover the full XDG asset directory.
 - CORS: default same-origin (`webprism.local` only); configurable `Access-Control-Allow-Origin` allowlist for cross-origin use.
+
+## Ideas
+
+- REST service:
+  - scoring (see phase 5)
+  - to get cleaned content, may be useful for scrapper, MCP, ...

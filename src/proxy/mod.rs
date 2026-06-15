@@ -27,6 +27,7 @@ use crate::error::ProxyError;
 use crate::filter::AdBlockEngine;
 use crate::proxy::ca::CertificateAuthority;
 use crate::proxy::fingerprint::FingerprintProfiles;
+use crate::scanner::TextScanner;
 use crate::scripting::{RequestCtx, ScriptEngine};
 
 /// Shorthand body type used throughout the proxy.
@@ -56,6 +57,7 @@ pub async fn run(
     profiles: Arc<FingerprintProfiles>,
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
+    scanner: Arc<TextScanner>,
 ) -> Result<(), ProxyError> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("proxy listening on {addr}");
@@ -68,9 +70,12 @@ pub async fn run(
         let profiles = Arc::clone(&profiles);
         let engine = Arc::clone(&engine);
         let blocker = Arc::clone(&blocker);
+        let scanner = Arc::clone(&scanner);
 
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, ca, profiles, engine, blocker).await {
+            if let Err(err) =
+                handle_connection(stream, ca, profiles, engine, blocker, scanner).await
+            {
                 tracing::warn!("connection error from {peer}: {err}");
             }
         });
@@ -84,6 +89,7 @@ async fn handle_connection(
     profiles: Arc<FingerprintProfiles>,
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
+    scanner: Arc<TextScanner>,
 ) -> Result<(), ProxyError> {
     let io = TokioIo::new(stream);
     server_http1::Builder::new()
@@ -95,7 +101,8 @@ async fn handle_connection(
                 let profiles = Arc::clone(&profiles);
                 let engine = Arc::clone(&engine);
                 let blocker = Arc::clone(&blocker);
-                async move { proxy_request(req, ca, profiles, engine, blocker).await }
+                let scanner = Arc::clone(&scanner);
+                async move { proxy_request(req, ca, profiles, engine, blocker, scanner).await }
             }),
         )
         .with_upgrades()
@@ -110,11 +117,12 @@ async fn proxy_request(
     profiles: Arc<FingerprintProfiles>,
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
+    scanner: Arc<TextScanner>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     if req.method() == Method::CONNECT {
-        handle_connect(req, ca, profiles, engine, blocker).await
+        handle_connect(req, ca, profiles, engine, blocker, scanner).await
     } else {
-        forward_http(req, engine, blocker).await
+        forward_http(req, engine, blocker, scanner).await
     }
 }
 
@@ -128,6 +136,7 @@ async fn handle_connect(
     profiles: Arc<FingerprintProfiles>,
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
+    scanner: Arc<TextScanner>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     let authority = req
         .uri()
@@ -155,8 +164,17 @@ async fn handle_connect(
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
-                if let Err(err) =
-                    do_mitm(upgraded, host, port, ca, profile_config, engine, blocker).await
+                if let Err(err) = do_mitm(
+                    upgraded,
+                    host,
+                    port,
+                    ca,
+                    profile_config,
+                    engine,
+                    blocker,
+                    scanner,
+                )
+                .await
                 {
                     tracing::warn!("MITM error: {err}");
                 }
@@ -177,6 +195,7 @@ async fn handle_connect(
 /// then connects to the upstream server using the browser-matched TLS profile
 /// and forwards each HTTP request.  Network-blocked requests are answered with
 /// `204 No Content` without touching the upstream.
+#[allow(clippy::too_many_arguments)]
 async fn do_mitm(
     upgraded: hyper::upgrade::Upgraded,
     host: String,
@@ -185,6 +204,7 @@ async fn do_mitm(
     client_config: Arc<ClientConfig>,
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
+    scanner: Arc<TextScanner>,
 ) -> Result<(), ProxyError> {
     // Accept the client's TLS handshake using a per-domain leaf cert.
     let server_cfg = ca.server_config(&host)?;
@@ -228,6 +248,7 @@ async fn do_mitm(
                 let sender = Arc::clone(&sender);
                 let engine = Arc::clone(&engine);
                 let blocker = Arc::clone(&blocker);
+                let scanner = Arc::clone(&scanner);
                 let host = host.clone();
                 async move {
                     let (mut req_parts, body) = req.into_parts();
@@ -262,18 +283,33 @@ async fn do_mitm(
                         .map_err(ProxyError::Http)?
                         .to_bytes();
 
-                    // Apply ad-block cosmetic rules and scripting rules to HTML responses.
-                    let is_html = resp_parts
+                    let content_type = resp_parts
                         .headers
                         .get(hyper::header::CONTENT_TYPE)
                         .and_then(|v| v.to_str().ok())
-                        .map(|ct| ct.contains("text/html"))
-                        .unwrap_or(false);
+                        .unwrap_or("")
+                        .to_string();
+                    let is_html = content_type.contains("text/html");
+                    let is_text = is_html || content_type.contains("text/plain");
 
+                    // Scan text payloads in async context before any HTML rewriting.
+                    if is_text {
+                        let matches = scanner.scan(&resp_bytes).await;
+                        if !matches.is_empty() {
+                            tracing::warn!(
+                                url = %req_url,
+                                categories = ?matches.iter()
+                                    .map(|m| format!("{}:{}", m.category, m.count))
+                                    .collect::<Vec<_>>(),
+                                "content scan flagged"
+                            );
+                        }
+                    }
+
+                    // Apply ad-block cosmetic rules and scripting rules to HTML responses.
                     let final_bytes = if is_html {
-                        let url = format!("https://{host}{}", req_parts.uri);
                         let ctx = RequestCtx {
-                            url,
+                            url: req_url.clone(),
                             host: host.clone(),
                             content_type: "text/html".to_string(),
                         };
@@ -320,6 +356,7 @@ async fn forward_http(
     req: Request<Incoming>,
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
+    scanner: Arc<TextScanner>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     let uri = req.uri().clone();
     let host = uri
@@ -369,14 +406,30 @@ async fn forward_http(
         .map_err(ProxyError::Http)?
         .to_bytes();
 
-    // Apply ad-block cosmetic rules and scripting rules to HTML responses.
-    let is_html = resp_parts
+    let content_type = resp_parts
         .headers
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.contains("text/html"))
-        .unwrap_or(false);
+        .unwrap_or("")
+        .to_string();
+    let is_html = content_type.contains("text/html");
+    let is_text = is_html || content_type.contains("text/plain");
 
+    // Scan text payloads in async context before any HTML rewriting.
+    if is_text {
+        let matches = scanner.scan(&resp_bytes).await;
+        if !matches.is_empty() {
+            tracing::warn!(
+                url = %uri,
+                categories = ?matches.iter()
+                    .map(|m| format!("{}:{}", m.category, m.count))
+                    .collect::<Vec<_>>(),
+                "content scan flagged"
+            );
+        }
+    }
+
+    // Apply ad-block cosmetic rules and scripting rules to HTML responses.
     let final_bytes = if is_html {
         let ctx = RequestCtx {
             url: uri.to_string(),

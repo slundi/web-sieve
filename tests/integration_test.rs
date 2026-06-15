@@ -15,6 +15,7 @@ use web_sieve::filter::AdBlockEngine;
 use web_sieve::proxy::ca::CertificateAuthority;
 use web_sieve::proxy::fingerprint::FingerprintProfiles;
 use web_sieve::proxy::tls::load_system_root_store;
+use web_sieve::scanner::TextScanner;
 use web_sieve::scripting::ScriptEngine;
 
 /// Start a minimal HTTP echo server and return its bound address.
@@ -73,6 +74,9 @@ async fn start_proxy() -> SocketAddr {
         .await
         .expect("ad-block engine");
 
+    let dicts_dir = dir.path().join("dicts");
+    let scanner = TextScanner::new(dicts_dir).await.expect("text scanner");
+
     // Keep tempdir alive for the duration of the test by leaking it.
     std::mem::forget(dir);
 
@@ -84,7 +88,7 @@ async fn start_proxy() -> SocketAddr {
     drop(listener);
 
     tokio::spawn(async move {
-        web_sieve::proxy::run(proxy_addr, ca, profiles, engine, blocker)
+        web_sieve::proxy::run(proxy_addr, ca, profiles, engine, blocker, scanner)
             .await
             .expect("proxy run");
     });

@@ -14,6 +14,7 @@ use web_sieve::filter::AdBlockEngine;
 use web_sieve::proxy::ca::CertificateAuthority;
 use web_sieve::proxy::fingerprint::FingerprintProfiles;
 use web_sieve::proxy::tls::load_system_root_store;
+use web_sieve::scanner::TextScanner;
 use web_sieve::scripting::ScriptEngine;
 
 /// Command-line options for the web-sieve proxy.
@@ -39,6 +40,10 @@ struct Opts {
     /// Directory containing ad-block list files (*.txt in EasyList/uBlock format).
     #[bpaf(long("lists-dir"), argument("PATH"), optional)]
     lists_dir: Option<PathBuf>,
+
+    /// Directory containing content-scanner dictionary files (*.txt, one term per line).
+    #[bpaf(long("dicts-dir"), argument("PATH"), optional)]
+    dicts_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -59,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         ca_key_path: opts.ca_key.unwrap_or(defaults.ca_key_path),
         rules_dir: opts.rules_dir.unwrap_or(defaults.rules_dir),
         lists_dir: opts.lists_dir.unwrap_or(defaults.lists_dir),
+        dicts_dir: opts.dicts_dir.unwrap_or(defaults.dicts_dir),
     };
 
     tracing::info!("starting web-sieve proxy");
@@ -80,7 +86,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to initialise ad-block engine")?;
 
-    web_sieve::proxy::run(config.bind_addr, ca, profiles, engine, blocker)
+    let scanner = TextScanner::new(config.dicts_dir.clone())
+        .await
+        .context("failed to initialise text scanner")?;
+
+    web_sieve::proxy::run(config.bind_addr, ca, profiles, engine, blocker, scanner)
         .await
         .context("proxy exited with error")?;
 

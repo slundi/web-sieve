@@ -25,6 +25,8 @@ pub struct Config {
     pub rules_dir: PathBuf,
     /// Directory containing ad-block list files (*.txt in EasyList/uBlock format).
     pub lists_dir: PathBuf,
+    /// Directory containing content-scanner dictionary files (*.txt, one term per line).
+    pub dicts_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -38,6 +40,7 @@ impl Default for Config {
             ca_key_path: config_dir.join("ca.key"),
             rules_dir: config_dir.join("rules"),
             lists_dir: config_dir.join("lists"),
+            dicts_dir: config_dir.join("dicts"),
         }
     }
 }
@@ -86,5 +89,12 @@ mod tests {
         let config = Config::default();
         assert!(config.lists_dir.to_string_lossy().contains("web-sieve"));
         assert!(config.lists_dir.ends_with("lists"));
+    }
+
+    #[test]
+    fn test_default_dicts_dir() {
+        let config = Config::default();
+        assert!(config.dicts_dir.to_string_lossy().contains("web-sieve"));
+        assert!(config.dicts_dir.ends_with("dicts"));
     }
 }
