@@ -490,6 +490,11 @@ async fn forward_http(
             {
                 return None;
             }
+            // Plain HTTP = unverified domain; check for phishing indicators.
+            if is_html && crate::phishing::check(&raw) {
+                tracing::warn!(url = %ctx.url, "phishing indicators detected, blocking");
+                return None;
+            }
             if !is_html || ops.is_empty() {
                 Some(raw)
             } else {

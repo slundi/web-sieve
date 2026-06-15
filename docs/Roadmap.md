@@ -90,7 +90,7 @@
 - Starlark recipes to scrape torrent/DDL sites into structured datasets.
 - Re-render as clean tabular HTML with webhook buttons (e.g. send magnet links directly to qBittorrent on click).
 
-## Phase 5 — Content Inspection & Safety Controls
+## Phase 5 — Content Inspection & Safety Controls ✅
 
 **Objective:** Deep semantic inspection for parental controls and anti-phishing.
 
@@ -102,7 +102,7 @@
 
 - Starlark scoring rules: block a page only when a configurable density threshold of flagged terms is reached, preventing false positives.
 
-### Step 5.3 — Heuristic Anti-Phishing Engine
+### Step 5.3 — Heuristic Anti-Phishing Engine ✅
 
 - Intercept `<form>` elements containing credential or PII inputs.
 - Flag forms served on unverified domains that also contain semantic panic triggers ("verify account", "unauthorized access").
