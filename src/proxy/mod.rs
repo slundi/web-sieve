@@ -292,29 +292,39 @@ async fn do_mitm(
                     let is_html = content_type.contains("text/html");
                     let is_text = is_html || content_type.contains("text/plain");
 
-                    // Scan text payloads in async context before any HTML rewriting.
-                    if is_text {
-                        let matches = scanner.scan(&resp_bytes).await;
-                        if !matches.is_empty() {
+                    // Scan text payloads in async context and collect matches for scripting.
+                    let scan_matches = if is_text {
+                        let m = scanner.scan(&resp_bytes).await;
+                        if !m.is_empty() {
                             tracing::warn!(
                                 url = %req_url,
-                                categories = ?matches.iter()
-                                    .map(|m| format!("{}:{}", m.category, m.count))
+                                categories = ?m.iter()
+                                    .map(|s| format!("{}:{}", s.category, s.count))
                                     .collect::<Vec<_>>(),
                                 "content scan flagged"
                             );
                         }
-                    }
+                        m
+                    } else {
+                        Vec::new()
+                    };
 
-                    // Apply ad-block cosmetic rules and scripting rules to HTML responses.
-                    let final_bytes = if is_html {
+                    // Run scripting + cosmetic rules for all text responses;
+                    // check for BlockPage before applying HTML rewriting.
+                    let maybe_bytes: Option<bytes::Bytes> = if is_text {
+                        let content_length = resp_bytes.len();
                         let ctx = RequestCtx {
                             url: req_url.clone(),
                             host: host.clone(),
-                            content_type: "text/html".to_string(),
+                            content_type: content_type.clone(),
+                            scan_matches,
+                            content_length,
                         };
-                        // Resolve cosmetic CSS before entering spawn_blocking.
-                        let cosmetic_css = blocker.cosmetic_css_for(&ctx.host).await;
+                        let cosmetic_css = if is_html {
+                            blocker.cosmetic_css_for(&host).await
+                        } else {
+                            None
+                        };
                         let engine = Arc::clone(&engine);
                         let raw: bytes::Bytes = resp_bytes;
                         tokio::task::spawn_blocking(move || {
@@ -323,18 +333,37 @@ async fn do_mitm(
                                 ops.push(crate::rewriter::RewriteOp::InjectStyle(css));
                             }
                             ops.extend(engine.run_rules(&ctx));
-                            if ops.is_empty() {
-                                raw
+                            if ops
+                                .iter()
+                                .any(|o| matches!(o, crate::rewriter::RewriteOp::BlockPage))
+                            {
+                                return None;
+                            }
+                            if !is_html || ops.is_empty() {
+                                Some(raw)
                             } else {
-                                crate::rewriter::apply(&ops, &raw)
-                                    .map(bytes::Bytes::from)
-                                    .unwrap_or(raw)
+                                Some(
+                                    crate::rewriter::apply(&ops, &raw)
+                                        .map(bytes::Bytes::from)
+                                        .unwrap_or(raw),
+                                )
                             }
                         })
                         .await
                         .map_err(|e| ProxyError::Scripting(e.to_string()))?
                     } else {
-                        resp_bytes
+                        Some(resp_bytes)
+                    };
+
+                    let final_bytes = match maybe_bytes {
+                        None => {
+                            tracing::info!(url = %req_url, "page blocked by content filter");
+                            return Ok(Response::builder()
+                                .status(StatusCode::FORBIDDEN)
+                                .body(full_body("Blocked by content filter"))
+                                .expect("valid response"));
+                        }
+                        Some(b) => b,
                     };
 
                     resp_parts.headers.remove(hyper::header::CONTENT_LENGTH);
@@ -415,29 +444,39 @@ async fn forward_http(
     let is_html = content_type.contains("text/html");
     let is_text = is_html || content_type.contains("text/plain");
 
-    // Scan text payloads in async context before any HTML rewriting.
-    if is_text {
-        let matches = scanner.scan(&resp_bytes).await;
-        if !matches.is_empty() {
+    // Scan text payloads in async context and collect matches for scripting.
+    let scan_matches = if is_text {
+        let m = scanner.scan(&resp_bytes).await;
+        if !m.is_empty() {
             tracing::warn!(
                 url = %uri,
-                categories = ?matches.iter()
-                    .map(|m| format!("{}:{}", m.category, m.count))
+                categories = ?m.iter()
+                    .map(|s| format!("{}:{}", s.category, s.count))
                     .collect::<Vec<_>>(),
                 "content scan flagged"
             );
         }
-    }
+        m
+    } else {
+        Vec::new()
+    };
 
-    // Apply ad-block cosmetic rules and scripting rules to HTML responses.
-    let final_bytes = if is_html {
+    // Run scripting + cosmetic rules for all text responses;
+    // check for BlockPage before applying HTML rewriting.
+    let maybe_bytes: Option<bytes::Bytes> = if is_text {
+        let content_length = resp_bytes.len();
         let ctx = RequestCtx {
             url: uri.to_string(),
             host: host.clone(),
-            content_type: "text/html".to_string(),
+            content_type: content_type.clone(),
+            scan_matches,
+            content_length,
         };
-        // Resolve cosmetic CSS before entering spawn_blocking.
-        let cosmetic_css = blocker.cosmetic_css_for(&ctx.host).await;
+        let cosmetic_css = if is_html {
+            blocker.cosmetic_css_for(&host).await
+        } else {
+            None
+        };
         let raw = resp_bytes;
         tokio::task::spawn_blocking(move || {
             let mut ops: Vec<crate::rewriter::RewriteOp> = Vec::new();
@@ -445,18 +484,37 @@ async fn forward_http(
                 ops.push(crate::rewriter::RewriteOp::InjectStyle(css));
             }
             ops.extend(engine.run_rules(&ctx));
-            if ops.is_empty() {
-                raw
+            if ops
+                .iter()
+                .any(|o| matches!(o, crate::rewriter::RewriteOp::BlockPage))
+            {
+                return None;
+            }
+            if !is_html || ops.is_empty() {
+                Some(raw)
             } else {
-                crate::rewriter::apply(&ops, &raw)
-                    .map(bytes::Bytes::from)
-                    .unwrap_or(raw)
+                Some(
+                    crate::rewriter::apply(&ops, &raw)
+                        .map(bytes::Bytes::from)
+                        .unwrap_or(raw),
+                )
             }
         })
         .await
         .map_err(|e| ProxyError::Scripting(e.to_string()))?
     } else {
-        resp_bytes
+        Some(resp_bytes)
+    };
+
+    let final_bytes = match maybe_bytes {
+        None => {
+            tracing::info!(url = %uri, "page blocked by content filter");
+            return Ok(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(full_body("Blocked by content filter"))
+                .expect("valid response"));
+        }
+        Some(b) => b,
     };
 
     resp_parts.headers.remove(hyper::header::CONTENT_LENGTH);

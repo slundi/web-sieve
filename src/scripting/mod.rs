@@ -8,16 +8,21 @@ use starlark::environment::{FrozenModule, GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
+use starlark::values::Value;
 use starlark::values::dict::AllocDict;
 use starlark::values::none::NoneType;
 use tokio::sync::RwLock;
 
 use crate::rewriter::RewriteOp;
+use crate::scanner::ScanMatch;
 
-// ─── thread-local ops accumulator ──────────────────────────────────────────
+// ─── Thread-local accumulators ───────────────────────────────────────────────
 
 thread_local! {
     static PENDING_OPS: RefCell<Vec<RewriteOp>> = const { RefCell::new(Vec::new()) };
+    /// Scan context set once per `execute_rule` call and read by `scan_matches()`
+    /// and `scan_content_length()` from within the Starlark process() function.
+    static SCAN_CTX: RefCell<(Vec<ScanMatch>, usize)> = const { RefCell::new((Vec::new(), 0)) };
 }
 
 // ─── Starlark global functions ──────────────────────────────────────────────
@@ -55,6 +60,47 @@ fn proxy_globals(builder: &mut GlobalsBuilder) {
         });
         Ok(NoneType)
     }
+
+    /// Block the page: the proxy returns 403 instead of this response.
+    ///
+    /// Intended for use in scoring rules — call only when the computed
+    /// term density exceeds the configured threshold.
+    fn block_page() -> anyhow::Result<NoneType> {
+        PENDING_OPS.with(|ops| ops.borrow_mut().push(RewriteOp::BlockPage));
+        Ok(NoneType)
+    }
+
+    /// Return a dict of `{category: hit_count}` for the current response.
+    ///
+    /// Only categories with at least one hit are included.  Use this together
+    /// with `scan_content_length()` to compute a density and decide whether to
+    /// call `block_page()`.
+    ///
+    /// Example:
+    /// ```python
+    /// def process(request):
+    ///     m = scan_matches()
+    ///     n = scan_content_length()
+    ///     if n > 0 and m.get("violence", 0) / n > 0.001:
+    ///         block_page()
+    /// ```
+    fn scan_matches<'v>(eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<Value<'v>> {
+        let pairs: Vec<(String, i64)> = SCAN_CTX.with(|ctx| {
+            ctx.borrow()
+                .0
+                .iter()
+                .map(|m| (m.category.clone(), m.count as i64))
+                .collect()
+        });
+        Ok(eval.heap().alloc(AllocDict(pairs)))
+    }
+
+    /// Return the byte length of the response body being processed.
+    ///
+    /// Divide a category's hit count by this value to get hits-per-byte density.
+    fn scan_content_length() -> anyhow::Result<i64> {
+        Ok(SCAN_CTX.with(|ctx| ctx.borrow().1 as i64))
+    }
 }
 
 // ─── Public types ───────────────────────────────────────────────────────────
@@ -67,6 +113,10 @@ pub struct RequestCtx {
     pub host: String,
     /// Value of the `Content-Type` response header.
     pub content_type: String,
+    /// Scan matches from the text scanner (category → hit count).
+    pub scan_matches: Vec<ScanMatch>,
+    /// Byte length of the response body.
+    pub content_length: usize,
 }
 
 /// A compiled Starlark rule file ready for evaluation.
@@ -211,8 +261,11 @@ fn execute_rule(frozen: &FrozenModule, ctx: &RequestCtx) -> Vec<RewriteOp> {
         }
     };
 
-    // Clear any leftover ops from previous invocations.
+    // Clear any leftover ops and populate the scan context for this invocation.
     PENDING_OPS.with(|ops| ops.borrow_mut().clear());
+    SCAN_CTX.with(|sc| {
+        *sc.borrow_mut() = (ctx.scan_matches.clone(), ctx.content_length);
+    });
 
     let result = Module::with_temp_heap(|call_module| -> anyhow::Result<()> {
         let mut eval = Evaluator::new(&call_module);
@@ -231,6 +284,9 @@ fn execute_rule(frozen: &FrozenModule, ctx: &RequestCtx) -> Vec<RewriteOp> {
             .map_err(|e| anyhow::anyhow!("process() error: {e}"))?;
         Ok(())
     });
+
+    // Always clear the scan context after the rule runs.
+    SCAN_CTX.with(|sc| *sc.borrow_mut() = (Vec::new(), 0));
 
     if let Err(e) = result {
         tracing::warn!(error = %e, "rule execution failed");
@@ -294,6 +350,16 @@ mod tests {
         f
     }
 
+    fn ctx(url: &str) -> RequestCtx {
+        RequestCtx {
+            url: url.into(),
+            host: "example.com".into(),
+            content_type: "text/html".into(),
+            scan_matches: Vec::new(),
+            content_length: 0,
+        }
+    }
+
     #[test]
     fn test_load_rule_with_valid_script() {
         let f = write_tempfile("def process(request):\n    pass\n");
@@ -305,13 +371,7 @@ mod tests {
     fn test_load_rule_missing_process_fn() {
         let f = write_tempfile("x = 1\n");
         let rule = load_rule(f.path()).expect("load succeeds even without process");
-        // execute_rule should return empty vec, not panic
-        let ctx = RequestCtx {
-            url: "http://example.com/".into(),
-            host: "example.com".into(),
-            content_type: "text/html".into(),
-        };
-        let ops = execute_rule(&rule.frozen, &ctx);
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
         assert!(ops.is_empty());
     }
 
@@ -324,12 +384,7 @@ def process(request):
 "#,
         );
         let rule = load_rule(f.path()).expect("load");
-        let ctx = RequestCtx {
-            url: "http://example.com/".into(),
-            host: "example.com".into(),
-            content_type: "text/html".into(),
-        };
-        let ops = execute_rule(&rule.frozen, &ctx);
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0], RewriteOp::RemoveElement("div.foo".into()));
     }
@@ -343,14 +398,114 @@ def process(request):
 "#,
         );
         let rule = load_rule(f.path()).expect("load");
-        let ctx = RequestCtx {
-            url: "http://example.com/".into(),
-            host: "example.com".into(),
-            content_type: "text/html".into(),
-        };
-        let ops = execute_rule(&rule.frozen, &ctx);
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], RewriteOp::ReaderMode));
+    }
+
+    #[test]
+    fn test_execute_rule_block_page() {
+        let f = write_tempfile(
+            r#"
+def process(request):
+    block_page()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
+    }
+
+    #[test]
+    fn test_execute_rule_scan_matches_empty() {
+        let f = write_tempfile(
+            r#"
+def process(request):
+    m = scan_matches()
+    if len(m) != 0:
+        remove_element("should-not-happen")
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
+        assert!(ops.is_empty(), "no matches in ctx → no ops: {ops:?}");
+    }
+
+    #[test]
+    fn test_execute_rule_scan_matches_with_data() {
+        let f = write_tempfile(
+            r#"
+def process(request):
+    m = scan_matches()
+    if m.get("violence", 0) > 5:
+        block_page()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.scan_matches = vec![ScanMatch {
+            category: "violence".into(),
+            count: 10,
+        }];
+        c.content_length = 1000;
+
+        let ops = execute_rule(&rule.frozen, &c);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
+    }
+
+    #[test]
+    fn test_execute_rule_density_threshold_not_reached() {
+        let f = write_tempfile(
+            r#"
+def process(request):
+    m = scan_matches()
+    n = scan_content_length()
+    if n > 0 and m.get("spam", 0) / n > 0.01:
+        block_page()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.scan_matches = vec![ScanMatch {
+            category: "spam".into(),
+            count: 2,
+        }];
+        c.content_length = 10_000; // density = 0.0002, below 0.01
+
+        let ops = execute_rule(&rule.frozen, &c);
+        assert!(
+            ops.is_empty(),
+            "density below threshold → no block: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_execute_rule_density_threshold_reached() {
+        let f = write_tempfile(
+            r#"
+def process(request):
+    m = scan_matches()
+    n = scan_content_length()
+    if n > 0 and m.get("spam", 0) / n > 0.01:
+        block_page()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.scan_matches = vec![ScanMatch {
+            category: "spam".into(),
+            count: 200,
+        }];
+        c.content_length = 1_000; // density = 0.2, above 0.01
+
+        let ops = execute_rule(&rule.frozen, &c);
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
     }
 
     #[tokio::test]

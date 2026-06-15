@@ -98,7 +98,7 @@
 
 - `aho-corasick` multi-pattern search on raw text payloads against configurable dictionary matrices.
 
-### Step 5.2 — Weighted Semantic Filtering
+### Step 5.2 — Weighted Semantic Filtering ✅
 
 - Starlark scoring rules: block a page only when a configurable density threshold of flagged terms is reached, preventing false positives.
 

@@ -21,6 +21,9 @@ pub enum RewriteOp {
     /// Fire-and-forget HTTP POST webhook — sent as a side-effect; does not alter
     /// the document.
     Webhook { url: String, body: String },
+    /// Block the page entirely; the proxy returns 403 instead of the content.
+    /// Handled at the proxy layer — `apply` ignores this variant.
+    BlockPage,
 }
 
 /// Apply a sequence of [`RewriteOp`]s to an HTML document in a single streaming pass.
@@ -56,14 +59,14 @@ pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> 
     };
     let working: &[u8] = reader_buf.as_deref().unwrap_or(html);
 
-    // 3. Build lol-html element handlers (skip ReaderMode / Webhook).
+    // 3. Build lol-html element handlers (skip ReaderMode / Webhook / BlockPage).
     let mut output = Vec::with_capacity(working.len());
     let mut element_handlers: Vec<(Cow<'static, Selector>, ElementContentHandlers<'_>)> =
         Vec::new();
 
     for op in ops {
         match op {
-            RewriteOp::ReaderMode | RewriteOp::Webhook { .. } => {}
+            RewriteOp::ReaderMode | RewriteOp::Webhook { .. } | RewriteOp::BlockPage => {}
             RewriteOp::RemoveElement(sel) => {
                 let selector: Selector = match sel.parse() {
                     Ok(s) => s,
