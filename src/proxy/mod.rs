@@ -253,6 +253,7 @@ async fn do_mitm(
                 async move {
                     let (mut req_parts, body) = req.into_parts();
                     headers::strip_hop_by_hop(&mut req_parts.headers);
+                    headers::strip_accept_encoding(&mut req_parts.headers);
                     let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
 
                     // Network blocking: check before forwarding to upstream.
@@ -407,6 +408,7 @@ async fn forward_http(
 
     // Strip all hop-by-hop headers (including proxy-connection).
     headers::strip_hop_by_hop(&mut parts.headers);
+    headers::strip_accept_encoding(&mut parts.headers);
 
     let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
 

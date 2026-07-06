@@ -83,15 +83,23 @@ fn load_certs_from_file(path: &str, store: &mut RootCertStore) -> Result<usize, 
 mod tests {
     use super::*;
 
+    fn setup_crypto() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
     #[test]
     fn test_make_client_config_returns_ok() {
-        // Should succeed even if no system certs are found.
+        setup_crypto();
         let result = make_client_config();
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_make_client_config_is_arc() {
+        setup_crypto();
         let config = make_client_config().unwrap();
         // Verify we can clone the Arc without issues.
         let _clone = Arc::clone(&config);

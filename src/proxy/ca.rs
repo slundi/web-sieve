@@ -171,7 +171,15 @@ fn build_ca_params() -> CertificateParams {
 mod tests {
     use super::*;
 
+    fn setup_crypto() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
     fn temp_ca() -> (Arc<CertificateAuthority>, tempfile::TempDir) {
+        setup_crypto();
         let dir = tempfile::tempdir().expect("tempdir");
         let cert = dir.path().join("ca.crt");
         let key = dir.path().join("ca.key");

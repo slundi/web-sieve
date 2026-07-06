@@ -41,10 +41,11 @@ pub struct ScanMatch {
 /// use std::path::PathBuf;
 /// use web_sieve::scanner::TextScanner;
 ///
-/// # tokio_test::block_on(async {
+/// # let rt = tokio::runtime::Runtime::new().unwrap();
+/// # rt.block_on(async {
 /// let scanner = TextScanner::new(PathBuf::from("/tmp/dicts")).await.unwrap();
-/// let matches = scanner.scan(b"some page text");
-/// # })
+/// let matches = scanner.scan(b"some page text").await;
+/// # });
 /// ```
 pub struct TextScanner {
     dicts: Arc<RwLock<Vec<Dictionary>>>,

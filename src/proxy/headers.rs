@@ -44,6 +44,16 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+/// Remove `Accept-Encoding` from request headers before forwarding.
+///
+/// The rewriting pipeline (lol-html, content scanner) cannot process
+/// compressed response bodies. Stripping this header causes upstream
+/// servers to respond with uncompressed content that the proxy can
+/// inspect and rewrite directly.
+pub fn strip_accept_encoding(headers: &mut HeaderMap) {
+    headers.remove(hyper::header::ACCEPT_ENCODING);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +90,34 @@ mod tests {
         assert!(headers.get("authorization").is_some());
         assert!(headers.get("user-agent").is_some());
         assert!(headers.get("x-custom").is_some());
+    }
+
+    #[test]
+    fn test_strip_accept_encoding_removes_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            hyper::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, deflate, br"),
+        );
+        headers.insert("content-type", HeaderValue::from_static("text/html"));
+
+        strip_accept_encoding(&mut headers);
+
+        assert!(headers.get(hyper::header::ACCEPT_ENCODING).is_none());
+        assert!(
+            headers.get("content-type").is_some(),
+            "end-to-end headers must survive"
+        );
+    }
+
+    #[test]
+    fn test_strip_accept_encoding_noop_when_absent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer tok"));
+
+        strip_accept_encoding(&mut headers);
+
+        assert!(headers.get("authorization").is_some());
     }
 
     #[test]
