@@ -387,7 +387,10 @@ async fn do_mitm(
                         Some(b) => b,
                     };
 
-                    resp_parts.headers.remove(hyper::header::CONTENT_LENGTH);
+                    resp_parts.headers.insert(
+                        hyper::header::CONTENT_LENGTH,
+                        hyper::header::HeaderValue::from(final_bytes.len()),
+                    );
                     Ok::<_, ProxyError>(Response::from_parts(resp_parts, full_body(final_bytes)))
                 }
             }),
@@ -561,7 +564,10 @@ async fn forward_http(
         Some(b) => b,
     };
 
-    resp_parts.headers.remove(hyper::header::CONTENT_LENGTH);
+    resp_parts.headers.insert(
+        hyper::header::CONTENT_LENGTH,
+        hyper::header::HeaderValue::from(final_bytes.len()),
+    );
     Ok(Response::from_parts(resp_parts, full_body(final_bytes)))
 }
 
@@ -588,5 +594,30 @@ mod tests {
             .body(())
             .expect("request");
         assert!(req.uri().authority().is_none());
+    }
+
+    #[test]
+    fn content_length_insert_overwrites_stale_upstream_value() {
+        use hyper::header::{CONTENT_LENGTH, HeaderValue};
+
+        let upstream_len: usize = 100;
+        let rewritten = Bytes::from(vec![b'x'; 137]);
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(upstream_len));
+
+        // Simulate what the proxy now does after rewriting.
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(rewritten.len()));
+
+        let reported: usize = headers[CONTENT_LENGTH].to_str().unwrap().parse().unwrap();
+        assert_eq!(
+            reported,
+            rewritten.len(),
+            "Content-Length must reflect rewritten body"
+        );
+        assert_ne!(
+            reported, upstream_len,
+            "stale upstream value must be replaced"
+        );
     }
 }

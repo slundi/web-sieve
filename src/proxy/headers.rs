@@ -121,6 +121,17 @@ mod tests {
     }
 
     #[test]
+    fn test_content_length_is_end_to_end() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", HeaderValue::from_static("4096"));
+        strip_hop_by_hop(&mut headers);
+        assert!(
+            headers.get("content-length").is_some(),
+            "content-length is an end-to-end header and must survive strip_hop_by_hop"
+        );
+    }
+
+    #[test]
     fn test_strips_connection_listed_headers() {
         let mut headers = HeaderMap::new();
         // Connection header lists "foo" as hop-by-hop.
