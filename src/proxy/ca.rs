@@ -11,6 +11,7 @@ use rcgen::{
 use rustls::ServerConfig;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use time::OffsetDateTime;
 
 use crate::error::ProxyError;
 
@@ -141,8 +142,9 @@ impl CertificateAuthority {
         leaf_params.subject_alt_names = vec![san];
         leaf_params.is_ca = IsCa::NoCa;
         leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        leaf_params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-        leaf_params.not_after = rcgen::date_time_ymd(2034, 1, 1);
+        let (not_before, not_after) = leaf_validity();
+        leaf_params.not_before = not_before;
+        leaf_params.not_after = not_after;
 
         let issuer = Issuer::from_params(&self.ca_params, &self.ca_key);
 
@@ -162,6 +164,27 @@ impl CertificateAuthority {
     }
 }
 
+/// Validity window for the root CA: 1 day in the past to 10 years in the future.
+///
+/// The 1-day back-date absorbs minor clock skew between the proxy host and
+/// TLS clients that validate `notBefore` strictly.
+fn ca_validity() -> (OffsetDateTime, OffsetDateTime) {
+    let now = OffsetDateTime::now_utc();
+    (
+        now - time::Duration::days(1),
+        now + time::Duration::days(365 * 10),
+    )
+}
+
+/// Validity window for a leaf certificate: ±1 day from now.
+///
+/// Short-lived leaves are fine here because they are regenerated from the
+/// in-memory CA whenever the LRU cache evicts them; clients never store them.
+fn leaf_validity() -> (OffsetDateTime, OffsetDateTime) {
+    let now = OffsetDateTime::now_utc();
+    (now - time::Duration::days(1), now + time::Duration::days(1))
+}
+
 /// Build [`CertificateParams`] for the root CA.
 fn build_ca_params() -> CertificateParams {
     let mut ca_params = CertificateParams::default();
@@ -171,8 +194,9 @@ fn build_ca_params() -> CertificateParams {
     ca_params.distinguished_name = dn;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca_params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-    ca_params.not_after = rcgen::date_time_ymd(2034, 1, 1);
+    let (not_before, not_after) = ca_validity();
+    ca_params.not_before = not_before;
+    ca_params.not_after = not_after;
     ca_params
 }
 
@@ -259,6 +283,60 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&cfg_a1, &cfg_a2),
             "a.com should have been evicted and re-issued with a new ServerConfig"
+        );
+    }
+
+    // ─── Validity window tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_ca_validity_not_before_in_past() {
+        let now = OffsetDateTime::now_utc();
+        let (not_before, _) = ca_validity();
+        assert!(
+            not_before < now,
+            "CA not_before must be in the past (clock-skew buffer)"
+        );
+        // Must not be more than 2 days old — catches accidental hardcoding.
+        assert!(
+            not_before > now - time::Duration::days(2),
+            "CA not_before is unexpectedly far in the past"
+        );
+    }
+
+    #[test]
+    fn test_ca_validity_not_after_far_future() {
+        let now = OffsetDateTime::now_utc();
+        let (_, not_after) = ca_validity();
+        assert!(
+            not_after > now + time::Duration::days(365),
+            "CA not_after must be at least 1 year ahead"
+        );
+        // Sanity upper bound — catches accidental 1000-year values.
+        assert!(
+            not_after < now + time::Duration::days(365 * 15),
+            "CA not_after is unexpectedly far in the future"
+        );
+    }
+
+    #[test]
+    fn test_leaf_validity_not_before_in_past() {
+        let now = OffsetDateTime::now_utc();
+        let (not_before, _) = leaf_validity();
+        assert!(not_before < now, "leaf not_before must be in the past");
+        assert!(
+            not_before > now - time::Duration::days(2),
+            "leaf not_before is unexpectedly far in the past"
+        );
+    }
+
+    #[test]
+    fn test_leaf_validity_not_after_near_future() {
+        let now = OffsetDateTime::now_utc();
+        let (_, not_after) = leaf_validity();
+        assert!(not_after > now, "leaf not_after must be in the future");
+        assert!(
+            not_after < now + time::Duration::days(2),
+            "leaf not_after must be within 2 days (short-lived cert)"
         );
     }
 }
