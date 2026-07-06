@@ -176,9 +176,10 @@ impl FingerprintProfiles {
     pub fn new(root_store: RootCertStore) -> Result<Self, ProxyError> {
         let chrome = Arc::new(chrome_config(root_store.clone())?);
         let firefox = Arc::new(firefox_config(root_store.clone())?);
-        let safari = Arc::new(safari_config(root_store.clone())?);
-        // Unknown falls back to the Chrome profile (safest default).
-        let unknown = Arc::new(chrome_config(root_store)?);
+        let safari = Arc::new(safari_config(root_store)?);
+        // Unknown falls back to the Chrome profile — share the same Arc rather
+        // than allocating an identical ClientConfig.
+        let unknown = Arc::clone(&chrome);
 
         Ok(Self {
             chrome,
@@ -363,6 +364,19 @@ mod tests {
                 "JA3 MD5 hash must be 32 hex chars for {browser:?}"
             );
         }
+    }
+
+    // --- Unknown profile shares Chrome allocation ---
+
+    #[test]
+    fn test_unknown_profile_is_same_arc_as_chrome() {
+        let profiles = FingerprintProfiles::new(RootCertStore::empty()).unwrap();
+        let chrome = profiles.config_for(Browser::Chrome);
+        let unknown = profiles.config_for(Browser::Unknown);
+        assert!(
+            Arc::ptr_eq(&chrome, &unknown),
+            "Unknown must reuse the Chrome Arc, not allocate a duplicate ClientConfig"
+        );
     }
 
     // --- ALPN regression: h2 must not be advertised upstream ---
