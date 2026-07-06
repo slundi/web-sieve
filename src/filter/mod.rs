@@ -230,7 +230,9 @@ impl AdBlockEngine {
     /// Return the combined cosmetic CSS for `host`, or `None` if there are no
     /// applicable rules.
     ///
-    /// Combines global rules with any host-specific rules.
+    /// Combines global rules with any host-specific rules.  Domain-specific
+    /// rules are collected with suffix matching so that a rule stored under
+    /// `example.com` also applies to `www.example.com`.
     ///
     /// This method is async and acquires a shared read lock without blocking the
     /// executor.  Call it from an async context and `.await` the result.
@@ -238,18 +240,14 @@ impl AdBlockEngine {
         let lists = self.lists.read().await;
 
         let global = &lists.global_cosmetic_css;
-        let domain_css = lists
-            .domain_cosmetic
-            .get(host)
-            .map(String::as_str)
-            .unwrap_or("");
+        let domain_css = collect_domain_css(&lists.domain_cosmetic, host);
 
         if global.is_empty() && domain_css.is_empty() {
             return None;
         }
 
         let combined = match (global.is_empty(), domain_css.is_empty()) {
-            (true, _) => domain_css.to_string(),
+            (true, _) => domain_css,
             (_, true) => global.clone(),
             _ => format!("{global}\n{domain_css}"),
         };
@@ -264,6 +262,26 @@ impl AdBlockEngine {
 }
 
 // ─── Private helpers ─────────────────────────────────────────────────────────
+
+/// Collect domain-specific cosmetic CSS for `host` using suffix matching.
+///
+/// Iterates label suffixes from longest to shortest (`www.example.com` →
+/// `example.com` → `com`) and joins all matching CSS blocks with a newline.
+/// This ensures EasyList rules like `example.com##.ad` apply to all subdomains.
+fn collect_domain_css(domain_cosmetic: &HashMap<String, String>, host: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut remaining = host;
+    loop {
+        if let Some(css) = domain_cosmetic.get(remaining) {
+            parts.push(css.as_str());
+        }
+        match remaining.find('.') {
+            Some(dot) => remaining = &remaining[dot + 1..],
+            None => break,
+        }
+    }
+    parts.join("\n")
+}
 
 /// Read all `*.txt` files in `lists_dir` (non-recursive), parse each, and merge.
 async fn load_all_lists(lists_dir: &Path) -> ParsedLists {
@@ -671,6 +689,114 @@ mod tests {
         assert!(
             css.contains(".sidebar-ad"),
             "cosmetic CSS should include .sidebar-ad: {css}"
+        );
+    }
+
+    // ─── collect_domain_css / subdomain matching ──────────────────────────
+
+    #[test]
+    fn test_collect_domain_css_exact() {
+        let mut map = HashMap::new();
+        map.insert("example.com".to_string(), ".ad{display:none}".to_string());
+        assert_eq!(collect_domain_css(&map, "example.com"), ".ad{display:none}");
+    }
+
+    #[test]
+    fn test_collect_domain_css_subdomain_inherits_parent() {
+        let mut map = HashMap::new();
+        map.insert("example.com".to_string(), ".ad{display:none}".to_string());
+        // www.example.com has no own entry but must pick up example.com's rule.
+        assert_eq!(
+            collect_domain_css(&map, "www.example.com"),
+            ".ad{display:none}"
+        );
+    }
+
+    #[test]
+    fn test_collect_domain_css_deep_subdomain() {
+        let mut map = HashMap::new();
+        map.insert("example.com".to_string(), ".ad{display:none}".to_string());
+        assert_eq!(
+            collect_domain_css(&map, "a.b.example.com"),
+            ".ad{display:none}"
+        );
+    }
+
+    #[test]
+    fn test_collect_domain_css_multi_level_combined() {
+        let mut map = HashMap::new();
+        map.insert(
+            "example.com".to_string(),
+            ".parent{display:none}".to_string(),
+        );
+        map.insert(
+            "www.example.com".to_string(),
+            ".www{display:none}".to_string(),
+        );
+        let css = collect_domain_css(&map, "www.example.com");
+        assert!(
+            css.contains(".www{display:none}"),
+            "own rule missing: {css}"
+        );
+        assert!(
+            css.contains(".parent{display:none}"),
+            "parent rule missing: {css}"
+        );
+    }
+
+    #[test]
+    fn test_collect_domain_css_no_false_match() {
+        let mut map = HashMap::new();
+        map.insert("example.com".to_string(), ".ad{display:none}".to_string());
+        // evil-example.com is a different label — must not match.
+        assert!(collect_domain_css(&map, "evil-example.com").is_empty());
+        // notexample.com likewise.
+        assert!(collect_domain_css(&map, "notexample.com").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_engine_subdomain_gets_parent_cosmetic_css() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("test.txt"), "example.com##.ad-sidebar\n")
+            .expect("write list");
+        let engine = AdBlockEngine::new(tmp.path().to_path_buf())
+            .await
+            .expect("engine");
+
+        // Exact key — regression guard.
+        assert!(
+            engine.cosmetic_css_for("example.com").await.is_some(),
+            "exact match must still work"
+        );
+
+        // Subdomain — was broken before this fix.
+        let css = engine
+            .cosmetic_css_for("www.example.com")
+            .await
+            .expect("subdomain must inherit parent domain cosmetic rules");
+        assert!(
+            css.contains(".ad-sidebar"),
+            "expected .ad-sidebar in: {css}"
+        );
+
+        // Deep subdomain.
+        assert!(
+            engine.cosmetic_css_for("a.b.example.com").await.is_some(),
+            "deep subdomain must inherit parent domain cosmetic rules"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_engine_unrelated_domain_no_cosmetic_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("test.txt"), "example.com##.ad-unit\n").expect("write list");
+        let engine = AdBlockEngine::new(tmp.path().to_path_buf())
+            .await
+            .expect("engine");
+
+        assert!(
+            engine.cosmetic_css_for("evil-example.com").await.is_none(),
+            "unrelated domain must not match"
         );
     }
 }
