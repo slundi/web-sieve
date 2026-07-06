@@ -70,11 +70,12 @@ fn load_certs_from_file(path: &str, store: &mut RootCertStore) -> Result<usize, 
         .flatten()
         .collect();
 
-    let count = certs.len();
+    let mut count = 0usize;
     for cert in certs {
-        store
-            .add(cert)
-            .map_err(|e| ProxyError::RootCerts(e.to_string()))?;
+        match store.add(cert) {
+            Ok(()) => count += 1,
+            Err(e) => tracing::warn!("skipping cert in {path}: {e}"),
+        }
     }
     Ok(count)
 }
@@ -109,5 +110,46 @@ mod tests {
     fn test_load_system_root_store_returns_store() {
         // Should always return a RootCertStore (empty or populated).
         let _store = load_system_root_store();
+    }
+
+    #[test]
+    fn test_load_certs_skips_bad_cert_and_returns_ok() {
+        setup_crypto();
+        use std::io::Write;
+
+        // Valid PEM wrapper around random non-DER bytes: pem_file_iter accepts
+        // this, but store.add() rejects it. Before the fix, add() would abort
+        // with Err; after the fix it logs a warning and returns Ok(0).
+        let bad_pem =
+            b"-----BEGIN CERTIFICATE-----\ndGhpcyBpcyBub3QgYSBjZXJ0aWZpY2F0ZQ==\n-----END CERTIFICATE-----\n";
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(bad_pem).unwrap();
+
+        let mut store = RootCertStore::empty();
+        let result = load_certs_from_file(tmp.path().to_str().unwrap(), &mut store);
+
+        assert!(
+            result.is_ok(),
+            "bad cert must not abort loading: {result:?}"
+        );
+        assert_eq!(result.unwrap(), 0, "no valid certs were added");
+    }
+
+    #[test]
+    fn test_load_certs_count_reflects_successfully_added() {
+        setup_crypto();
+        use std::io::Write;
+
+        // An empty PEM file: no certs to add → count must be 0, not an error.
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"").unwrap();
+
+        let mut store = RootCertStore::empty();
+        let result = load_certs_from_file(tmp.path().to_str().unwrap(), &mut store);
+
+        // pem_file_iter on an empty file returns an iterator with 0 items.
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
     }
 }
