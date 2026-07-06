@@ -39,18 +39,7 @@ pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> 
         return Ok(html.to_vec());
     }
 
-    // 1. Fire webhooks (side-effects only, do not block on errors).
-    for op in ops {
-        if let RewriteOp::Webhook { url, body } = op
-            && let Err(e) = ureq::post(url)
-                .set("Content-Type", "application/json")
-                .send_string(body)
-        {
-            tracing::warn!(url = %url, error = %e, "webhook delivery failed");
-        }
-    }
-
-    // 2. Reader mode optionally replaces the entire document.
+    // Reader mode optionally replaces the entire document.
     let reader_buf: Option<Vec<u8>> = if ops.iter().any(|o| matches!(o, RewriteOp::ReaderMode)) {
         let html_str = String::from_utf8_lossy(html);
         crate::reader::extract(&html_str).map(|a| crate::reader::render(&a))
@@ -59,7 +48,7 @@ pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> 
     };
     let working: &[u8] = reader_buf.as_deref().unwrap_or(html);
 
-    // 3. Build lol-html element handlers (skip ReaderMode / Webhook / BlockPage).
+    // Build lol-html element handlers (skip ReaderMode / Webhook / BlockPage).
     let mut output = Vec::with_capacity(working.len());
     let mut element_handlers: Vec<(Cow<'static, Selector>, ElementContentHandlers<'_>)> =
         Vec::new();
@@ -140,6 +129,22 @@ pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> 
     Ok(output)
 }
 
+/// Send an HTTP POST webhook asynchronously. Errors are logged and swallowed.
+///
+/// Intended to be spawned with `tokio::spawn` so delivery never blocks the
+/// proxy response path or its `spawn_blocking` thread pool.
+pub async fn fire_webhook(url: String, body: String) {
+    if let Err(e) = reqwest::Client::new()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+    {
+        tracing::warn!(url = %url, error = %e, "webhook delivery failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +190,55 @@ mod tests {
         assert!(
             output.contains("display:none"),
             "keep_only should inject display:none css: {output}"
+        );
+    }
+
+    #[test]
+    fn test_webhook_op_is_noop_in_apply() {
+        let html = b"<html><body>hello</body></html>";
+        let ops = vec![RewriteOp::Webhook {
+            url: "http://example.com/hook".to_string(),
+            body: r#"{"event":"test"}"#.to_string(),
+        }];
+        let result = apply(&ops, html).expect("apply");
+        assert_eq!(result, html, "webhook op must not modify HTML");
+    }
+
+    #[tokio::test]
+    async fn test_fire_webhook_sends_post() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/hook");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+
+        fire_webhook(url, r#"{"event":"test"}"#.to_string()).await;
+
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("POST /hook"),
+            "expected POST /hook, got: {request}"
+        );
+        assert!(
+            request.contains("application/json"),
+            "missing Content-Type: {request}"
+        );
+        assert!(
+            request.contains(r#"{"event":"test"}"#),
+            "missing body: {request}"
         );
     }
 

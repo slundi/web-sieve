@@ -328,30 +328,50 @@ async fn do_mitm(
                         };
                         let engine = Arc::clone(&engine);
                         let raw: bytes::Bytes = resp_bytes;
-                        tokio::task::spawn_blocking(move || {
-                            let mut ops: Vec<crate::rewriter::RewriteOp> = Vec::new();
-                            if let Some(css) = cosmetic_css {
-                                ops.push(crate::rewriter::RewriteOp::InjectStyle(css));
-                            }
-                            ops.extend(engine.run_rules(&ctx));
-                            if ops
-                                .iter()
-                                .any(|o| matches!(o, crate::rewriter::RewriteOp::BlockPage))
-                            {
-                                return None;
-                            }
-                            if !is_html || ops.is_empty() {
-                                Some(raw)
-                            } else {
-                                Some(
-                                    crate::rewriter::apply(&ops, &raw)
-                                        .map(bytes::Bytes::from)
-                                        .unwrap_or(raw),
-                                )
-                            }
-                        })
-                        .await
-                        .map_err(|e| ProxyError::Scripting(e.to_string()))?
+                        let (maybe_bytes, webhook_targets) =
+                            tokio::task::spawn_blocking(move || {
+                                let mut ops: Vec<crate::rewriter::RewriteOp> = Vec::new();
+                                if let Some(css) = cosmetic_css {
+                                    ops.push(crate::rewriter::RewriteOp::InjectStyle(css));
+                                }
+                                ops.extend(engine.run_rules(&ctx));
+                                if ops
+                                    .iter()
+                                    .any(|o| matches!(o, crate::rewriter::RewriteOp::BlockPage))
+                                {
+                                    return (None, Vec::new());
+                                }
+                                let webhooks: Vec<(String, String)> = ops
+                                    .iter()
+                                    .filter_map(|op| {
+                                        if let crate::rewriter::RewriteOp::Webhook { url, body } =
+                                            op
+                                        {
+                                            Some((url.clone(), body.clone()))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                if !is_html || ops.is_empty() {
+                                    (Some(raw), webhooks)
+                                } else {
+                                    (
+                                        Some(
+                                            crate::rewriter::apply(&ops, &raw)
+                                                .map(bytes::Bytes::from)
+                                                .unwrap_or(raw),
+                                        ),
+                                        webhooks,
+                                    )
+                                }
+                            })
+                            .await
+                            .map_err(|e| ProxyError::Scripting(e.to_string()))?;
+                        for (url, body) in webhook_targets {
+                            tokio::spawn(crate::rewriter::fire_webhook(url, body));
+                        }
+                        maybe_bytes
                     } else {
                         Some(resp_bytes)
                     };
@@ -480,7 +500,7 @@ async fn forward_http(
             None
         };
         let raw = resp_bytes;
-        tokio::task::spawn_blocking(move || {
+        let (maybe_bytes, webhook_targets) = tokio::task::spawn_blocking(move || {
             let mut ops: Vec<crate::rewriter::RewriteOp> = Vec::new();
             if let Some(css) = cosmetic_css {
                 ops.push(crate::rewriter::RewriteOp::InjectStyle(css));
@@ -490,25 +510,42 @@ async fn forward_http(
                 .iter()
                 .any(|o| matches!(o, crate::rewriter::RewriteOp::BlockPage))
             {
-                return None;
+                return (None, Vec::new());
             }
             // Plain HTTP = unverified domain; check for phishing indicators.
             if is_html && crate::phishing::check(&raw) {
                 tracing::warn!(url = %ctx.url, "phishing indicators detected, blocking");
-                return None;
+                return (None, Vec::new());
             }
+            let webhooks: Vec<(String, String)> = ops
+                .iter()
+                .filter_map(|op| {
+                    if let crate::rewriter::RewriteOp::Webhook { url, body } = op {
+                        Some((url.clone(), body.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             if !is_html || ops.is_empty() {
-                Some(raw)
+                (Some(raw), webhooks)
             } else {
-                Some(
-                    crate::rewriter::apply(&ops, &raw)
-                        .map(bytes::Bytes::from)
-                        .unwrap_or(raw),
+                (
+                    Some(
+                        crate::rewriter::apply(&ops, &raw)
+                            .map(bytes::Bytes::from)
+                            .unwrap_or(raw),
+                    ),
+                    webhooks,
                 )
             }
         })
         .await
-        .map_err(|e| ProxyError::Scripting(e.to_string()))?
+        .map_err(|e| ProxyError::Scripting(e.to_string()))?;
+        for (url, body) in webhook_targets {
+            tokio::spawn(crate::rewriter::fire_webhook(url, body));
+        }
+        maybe_bytes
     } else {
         Some(resp_bytes)
     };
