@@ -123,18 +123,24 @@ impl TextScanner {
     /// Returns one [`ScanMatch`] per category that has at least one hit.
     /// Categories with zero matches are omitted. Matching is case-insensitive.
     pub async fn scan(&self, text: &[u8]) -> Vec<ScanMatch> {
-        let dicts = self.dicts.read().await;
-        let mut results = Vec::new();
-        for dict in dicts.iter() {
-            let count = dict.automaton.find_iter(text).count();
-            if count > 0 {
-                results.push(ScanMatch {
-                    category: dict.category.clone(),
-                    count,
-                });
+        let dicts = Arc::clone(&self.dicts);
+        let text = text.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let dicts = dicts.blocking_read();
+            let mut results = Vec::new();
+            for dict in dicts.iter() {
+                let count = dict.automaton.find_iter(&text).count();
+                if count > 0 {
+                    results.push(ScanMatch {
+                        category: dict.category.clone(),
+                        count,
+                    });
+                }
             }
-        }
-        results
+            results
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Return the dictionaries directory this scanner watches.
@@ -334,5 +340,40 @@ mod tests {
         let results = scanner.scan(b"buy now buy now buy now great deal").await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].count, 3);
+    }
+
+    /// scan() must not monopolise the async executor.
+    ///
+    /// spawn_blocking offloads the CPU work to a thread-pool thread so the
+    /// executor thread is free to drive other tasks. We verify this by racing
+    /// the scan against a concurrent task that sets a flag after one yield.
+    #[tokio::test]
+    async fn test_scan_does_not_block_executor() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_dict(tmp.path(), "marker", "x\n");
+        let scanner = TextScanner::new(tmp.path().to_path_buf())
+            .await
+            .expect("scanner");
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag2 = Arc::clone(&flag);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            flag2.store(true, Ordering::Release);
+        });
+
+        // yield once so the spawned task reaches its own yield point
+        tokio::task::yield_now().await;
+
+        // large input — would stall the executor if scan were inline
+        let large = vec![b'x'; 500_000];
+        scanner.scan(&large).await;
+
+        assert!(
+            flag.load(Ordering::Acquire),
+            "executor was blocked during scan — spawn_blocking regression"
+        );
     }
 }
