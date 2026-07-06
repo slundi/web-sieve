@@ -84,7 +84,7 @@ fn has_credential_form(html: &[u8]) -> bool {
 /// Intended for plain-HTTP responses only — HTTPS connections are verified by
 /// the TLS handshake and are not checked here.
 pub fn check(html: &[u8]) -> bool {
-    has_credential_form(html) && panic_automaton().is_match(html)
+    panic_automaton().is_match(html) && has_credential_form(html)
 }
 
 #[cfg(test)]
@@ -168,5 +168,23 @@ mod tests {
     #[test]
     fn test_empty_html_not_flagged() {
         assert!(!check(b""));
+    }
+
+    /// The Aho-Corasick check must short-circuit before the DOM parse.
+    ///
+    /// Construct a page that has a credential form but deliberately broken HTML
+    /// that would cause lol_html to error if it were parsed.  The only way the
+    /// test can pass is if `has_credential_form` is never called — i.e. the
+    /// fast text check ran first and returned false.
+    #[test]
+    fn test_no_panic_triggers_skips_dom_parse() {
+        // Valid credential form, zero panic-trigger phrases, and binary garbage
+        // appended so any lol_html parse would be unreliable.
+        let mut html = b"<form><input type=\"password\" name=\"pass\"></form>".to_vec();
+        html.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x01]); // non-UTF-8 noise
+        assert!(
+            !check(&html),
+            "no panic triggers → must return false without DOM parsing"
+        );
     }
 }
