@@ -18,13 +18,15 @@ use crate::scanner::ScanMatch;
 
 // ─── Thread-local accumulators ───────────────────────────────────────────────
 
+const DEFAULT_DENSITY_THRESHOLD: f32 = 0.01;
+
 thread_local! {
     static PENDING_OPS: RefCell<Vec<RewriteOp>> = const { RefCell::new(Vec::new()) };
     /// Scan context set once per `execute_rule` call and read by `scan_matches()`
     /// and `scan_content_length()` from within the Starlark process() function.
     static SCAN_CTX: RefCell<(Vec<ScanMatch>, usize)> = const { RefCell::new((Vec::new(), 0)) };
     /// Configured density threshold, set per `run_rules` call.
-    static DENSITY_THRESHOLD: RefCell<f32> = const { RefCell::new(0.01) };
+    static DENSITY_THRESHOLD: RefCell<f32> = const { RefCell::new(DEFAULT_DENSITY_THRESHOLD) };
 }
 
 // ─── Starlark global functions ──────────────────────────────────────────────
@@ -172,17 +174,22 @@ impl ScriptEngine {
         // 1. Ensure the directory exists.
         tokio::fs::create_dir_all(&rules_dir).await?;
 
-        // 2. Load all existing .star files.
-        let mut initial_rules: Vec<LoadedRule> = Vec::new();
+        // 2. Load all existing .star files in sorted order for deterministic rule application.
+        let mut star_paths: Vec<std::path::PathBuf> = Vec::new();
         let mut read_dir = tokio::fs::read_dir(&rules_dir).await?;
         while let Some(entry) = read_dir.next_entry().await? {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("star") {
-                match load_rule(&path) {
-                    Ok(rule) => initial_rules.push(rule),
-                    Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "failed to load rule")
-                    }
+                star_paths.push(path);
+            }
+        }
+        star_paths.sort_unstable();
+        let mut initial_rules: Vec<LoadedRule> = Vec::new();
+        for path in &star_paths {
+            match load_rule(path) {
+                Ok(rule) => initial_rules.push(rule),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to load rule")
                 }
             }
         }
@@ -228,7 +235,7 @@ impl ScriptEngine {
             let ops = execute_rule(&rule.frozen, ctx);
             all_ops.extend(ops);
         }
-        DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = 0.01_f32);
+        DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = DEFAULT_DENSITY_THRESHOLD);
         all_ops
     }
 
@@ -546,10 +553,74 @@ def process(request):
         // Set the thread-local to 0.02 to simulate a custom CLI threshold.
         DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = 0.02_f32);
         let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
-        DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = 0.01_f32);
+        DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = DEFAULT_DENSITY_THRESHOLD);
 
         assert_eq!(ops.len(), 1, "threshold 0.02 > 0.005 → block_page: {ops:?}");
         assert!(matches!(ops[0], RewriteOp::BlockPage));
+    }
+
+    #[tokio::test]
+    async fn test_script_engine_loads_rules_in_sorted_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Write files in reverse alphabetical order to verify sorting.
+        for (name, selector) in [
+            ("c.star", "\"c\""),
+            ("a.star", "\"a\""),
+            ("b.star", "\"b\""),
+        ] {
+            std::fs::write(
+                tmp.path().join(name),
+                format!("def process(request):\n    remove_element({})\n", selector),
+            )
+            .expect("write");
+        }
+
+        let engine = ScriptEngine::new(tmp.path().to_path_buf(), 0.01)
+            .await
+            .expect("ScriptEngine::new");
+
+        let c = ctx("http://example.com/");
+        let ops = tokio::task::spawn_blocking(move || engine.run_rules(&c))
+            .await
+            .expect("spawn_blocking");
+        assert_eq!(ops.len(), 3, "expected 3 ops: {ops:?}");
+        assert_eq!(
+            ops[0],
+            RewriteOp::RemoveElement("a".into()),
+            "first op must come from a.star"
+        );
+        assert_eq!(
+            ops[1],
+            RewriteOp::RemoveElement("b".into()),
+            "second op must come from b.star"
+        );
+        assert_eq!(
+            ops[2],
+            RewriteOp::RemoveElement("c".into()),
+            "third op must come from c.star"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_rules_resets_density_threshold_to_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let engine = ScriptEngine::new(tmp.path().to_path_buf(), 0.5)
+            .await
+            .expect("ScriptEngine::new");
+
+        let c = ctx("http://example.com/");
+        // run_rules must run on a blocking thread; read back the thread-local from that same thread.
+        let threshold_after = tokio::task::spawn_blocking(move || {
+            engine.run_rules(&c);
+            DENSITY_THRESHOLD.with(|t| *t.borrow())
+        })
+        .await
+        .expect("spawn_blocking");
+
+        assert_eq!(
+            threshold_after, DEFAULT_DENSITY_THRESHOLD,
+            "threshold must be reset to DEFAULT_DENSITY_THRESHOLD after run_rules"
+        );
     }
 
     #[tokio::test]

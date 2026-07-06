@@ -155,8 +155,10 @@ async fn handle_connect(
         .unwrap_or("")
         .to_string();
     let browser = fingerprint::Browser::from_user_agent(&ua);
-    let (ja3_string, ja3_hash) = fingerprint::ja3_for_browser(browser);
-    tracing::debug!(%host, ?browser, ja3 = %ja3_hash, ja3_raw = %ja3_string, "CONNECT: selected fingerprint profile");
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let (ja3_string, ja3_hash) = fingerprint::ja3_for_browser(browser);
+        tracing::debug!(%host, ?browser, ja3 = %ja3_hash, ja3_raw = %ja3_string, "CONNECT: selected fingerprint profile");
+    }
     let profile_config = profiles.config_for(browser);
 
     let upgrade = hyper::upgrade::on(req);

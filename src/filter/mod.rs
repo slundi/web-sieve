@@ -488,9 +488,10 @@ fn merge_raw_rules(rules: Vec<RawRules>) -> ParsedLists {
     let global_cosmetic_css = if all_global_selectors.is_empty() {
         String::new()
     } else {
-        format!("{}{{}}", all_global_selectors.join(","))
-            // Embed display:none!important inside the braces.
-            .replace("{}", "{display:none!important}")
+        format!(
+            "{}{{display:none!important}}",
+            all_global_selectors.join(",")
+        )
     };
 
     // Build per-domain cosmetic CSS.
@@ -502,8 +503,7 @@ fn merge_raw_rules(rules: Vec<RawRules>) -> ParsedLists {
             if selectors.is_empty() {
                 None
             } else {
-                let css = format!("{}{{}}", selectors.join(","))
-                    .replace("{}", "{display:none!important}");
+                let css = format!("{}{{display:none!important}}", selectors.join(","));
                 Some((host, css))
             }
         })
