@@ -83,7 +83,7 @@ fn chrome_config(root_store: RootCertStore) -> Result<ClientConfig, ProxyError> 
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 
@@ -116,7 +116,7 @@ fn firefox_config(root_store: RootCertStore) -> Result<ClientConfig, ProxyError>
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 
@@ -149,7 +149,7 @@ fn safari_config(root_store: RootCertStore) -> Result<ClientConfig, ProxyError> 
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 
@@ -361,6 +361,27 @@ mod tests {
                 hash.len(),
                 32,
                 "JA3 MD5 hash must be 32 hex chars for {browser:?}"
+            );
+        }
+    }
+
+    // --- ALPN regression: h2 must not be advertised upstream ---
+
+    #[test]
+    fn test_alpn_http1_only() {
+        use rustls::RootCertStore;
+        let profiles = FingerprintProfiles::new(RootCertStore::empty()).unwrap();
+        for browser in [
+            Browser::Chrome,
+            Browser::Firefox,
+            Browser::Safari,
+            Browser::Unknown,
+        ] {
+            let config = profiles.config_for(browser);
+            assert_eq!(
+                config.alpn_protocols,
+                vec![b"http/1.1".to_vec()],
+                "profile {browser:?} must not advertise h2 — upstream only speaks HTTP/1.1"
             );
         }
     }
