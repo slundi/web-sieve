@@ -1,6 +1,6 @@
 //! Root CA management and per-domain leaf certificate generation.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -25,8 +25,8 @@ pub struct CertificateAuthority {
     ca_key: KeyPair,
     /// CA parameters used to build an [`Issuer`] for signing leaf certs.
     ca_params: CertificateParams,
-    /// Cache of per-domain [`ServerConfig`].
-    cache: Mutex<HashMap<String, Arc<ServerConfig>>>,
+    /// Bounded LRU cache of per-domain [`ServerConfig`].
+    cache: Mutex<lru::LruCache<String, Arc<ServerConfig>>>,
 }
 
 impl CertificateAuthority {
@@ -36,11 +36,21 @@ impl CertificateAuthority {
     /// ECDSA P-256 CA is generated and written to those paths (creating parent
     /// directories as needed).
     ///
+    /// `cache_capacity` bounds the per-domain [`ServerConfig`] LRU cache.
+    /// Passing `0` is a programmer error and will panic.
+    ///
     /// # Errors
     ///
     /// Returns a [`ProxyError`] if the files cannot be read/written or if
     /// certificate generation fails.
-    pub fn load_or_create(cert_path: &Path, key_path: &Path) -> Result<Arc<Self>, ProxyError> {
+    pub fn load_or_create(
+        cert_path: &Path,
+        key_path: &Path,
+        cache_capacity: usize,
+    ) -> Result<Arc<Self>, ProxyError> {
+        let cap = NonZeroUsize::new(cache_capacity)
+            .expect("cert_cache_capacity must be greater than zero");
+
         if cert_path.exists() && key_path.exists() {
             tracing::info!("loading existing CA from {}", cert_path.display());
             let ca_key = KeyPair::from_pem(&std::fs::read_to_string(key_path)?)
@@ -54,7 +64,7 @@ impl CertificateAuthority {
                 ca_cert_pem,
                 ca_key,
                 ca_params,
-                cache: Mutex::new(HashMap::new()),
+                cache: Mutex::new(lru::LruCache::new(cap)),
             }));
         }
 
@@ -78,7 +88,7 @@ impl CertificateAuthority {
             ca_cert_pem,
             ca_key,
             ca_params,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(lru::LruCache::new(cap)),
         }))
     }
 
@@ -101,17 +111,16 @@ impl CertificateAuthority {
     /// fails.
     pub fn server_config(&self, domain: &str) -> Result<Arc<ServerConfig>, ProxyError> {
         {
-            let cache = self.cache.lock().expect("CA cache lock poisoned");
+            let mut cache = self.cache.lock().expect("CA cache lock poisoned");
             if let Some(cfg) = cache.get(domain) {
                 return Ok(Arc::clone(cfg));
             }
         }
 
-        let cfg = self.build_server_config(domain)?;
-        let cfg = Arc::new(cfg);
+        let cfg = Arc::new(self.build_server_config(domain)?);
 
         let mut cache = self.cache.lock().expect("CA cache lock poisoned");
-        cache.insert(domain.to_string(), Arc::clone(&cfg));
+        cache.put(domain.to_string(), Arc::clone(&cfg));
         Ok(cfg)
     }
 
@@ -183,7 +192,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cert = dir.path().join("ca.crt");
         let key = dir.path().join("ca.key");
-        let ca = CertificateAuthority::load_or_create(&cert, &key).expect("CA creation failed");
+        let ca =
+            CertificateAuthority::load_or_create(&cert, &key, 2048).expect("CA creation failed");
         (ca, dir)
     }
 
@@ -193,7 +203,7 @@ mod tests {
         let cert = dir.path().join("ca.crt");
         let key = dir.path().join("ca.key");
 
-        let ca = CertificateAuthority::load_or_create(&cert, &key).expect("create CA");
+        let ca = CertificateAuthority::load_or_create(&cert, &key, 2048).expect("create CA");
         assert!(cert.exists(), "cert file should be written");
         assert!(key.exists(), "key file should be written");
 
@@ -207,8 +217,8 @@ mod tests {
         let cert = dir.path().join("ca.crt");
         let key = dir.path().join("ca.key");
 
-        CertificateAuthority::load_or_create(&cert, &key).expect("first create");
-        CertificateAuthority::load_or_create(&cert, &key).expect("reload CA");
+        CertificateAuthority::load_or_create(&cert, &key, 2048).expect("first create");
+        CertificateAuthority::load_or_create(&cert, &key, 2048).expect("reload CA");
     }
 
     #[test]
@@ -224,5 +234,31 @@ mod tests {
         let cfg1 = ca.server_config("cached.example.com").expect("first");
         let cfg2 = ca.server_config("cached.example.com").expect("second");
         assert!(Arc::ptr_eq(&cfg1, &cfg2), "configs should be the same Arc");
+    }
+
+    #[test]
+    fn test_server_config_evicts_lru_when_full() {
+        setup_crypto();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = CertificateAuthority::load_or_create(
+            &dir.path().join("ca.crt"),
+            &dir.path().join("ca.key"),
+            2,
+        )
+        .expect("CA");
+
+        // Fill the cache to capacity.
+        let cfg_a1 = ca.server_config("a.com").expect("a first");
+        let _cfg_b = ca.server_config("b.com").expect("b"); // a is now LRU
+
+        // Inserting a third domain evicts a.com (the LRU entry).
+        let _cfg_c = ca.server_config("c.com").expect("c");
+
+        // Re-issuing a.com must return a fresh Arc — it was evicted.
+        let cfg_a2 = ca.server_config("a.com").expect("a re-issued");
+        assert!(
+            !Arc::ptr_eq(&cfg_a1, &cfg_a2),
+            "a.com should have been evicted and re-issued with a new ServerConfig"
+        );
     }
 }

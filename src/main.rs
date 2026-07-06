@@ -49,6 +49,10 @@ struct Opts {
     /// Starlark scripts read this via `density_threshold()` instead of hard-coding a value.
     #[bpaf(long("density-threshold"), argument("FLOAT"), optional)]
     density_threshold: Option<f32>,
+
+    /// Maximum number of per-domain TLS certificates to keep in the cache (default: 2048).
+    #[bpaf(long("cert-cache-capacity"), argument("N"), optional)]
+    cert_cache_capacity: Option<usize>,
 }
 
 #[tokio::main]
@@ -71,13 +75,20 @@ async fn main() -> anyhow::Result<()> {
         lists_dir: opts.lists_dir.unwrap_or(defaults.lists_dir),
         dicts_dir: opts.dicts_dir.unwrap_or(defaults.dicts_dir),
         density_threshold: opts.density_threshold.unwrap_or(defaults.density_threshold),
+        cert_cache_capacity: opts
+            .cert_cache_capacity
+            .unwrap_or(defaults.cert_cache_capacity),
     };
 
     tracing::info!("starting web-sieve proxy");
     tracing::debug!(?config, "resolved configuration");
 
-    let ca = CertificateAuthority::load_or_create(&config.ca_cert_path, &config.ca_key_path)
-        .context("failed to initialise certificate authority")?;
+    let ca = CertificateAuthority::load_or_create(
+        &config.ca_cert_path,
+        &config.ca_key_path,
+        config.cert_cache_capacity,
+    )
+    .context("failed to initialise certificate authority")?;
 
     let root_store = load_system_root_store();
     let profiles = Arc::new(

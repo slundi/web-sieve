@@ -31,6 +31,10 @@ pub struct Config {
     /// a Starlark rule may call `block_page()`.  Exposed to scripts via
     /// `density_threshold()`.  Default: `0.01` (1 hit per 100 bytes).
     pub density_threshold: f32,
+    /// Maximum number of per-domain [`rustls::ServerConfig`] objects kept in
+    /// the certificate cache.  Oldest entries are evicted when the limit is
+    /// reached.  Default: `2048`.
+    pub cert_cache_capacity: usize,
 }
 
 impl Default for Config {
@@ -46,6 +50,7 @@ impl Default for Config {
             lists_dir: config_dir.join("lists"),
             dicts_dir: config_dir.join("dicts"),
             density_threshold: 0.01,
+            cert_cache_capacity: 2048,
         }
     }
 }
@@ -107,5 +112,10 @@ mod tests {
     fn test_default_density_threshold() {
         let config = Config::default();
         assert!((config.density_threshold - 0.01_f32).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_default_cert_cache_capacity() {
+        assert_eq!(Config::default().cert_cache_capacity, 2048);
     }
 }
