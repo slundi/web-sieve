@@ -72,16 +72,19 @@
 - `run_rules` skips the Starlark interpreter entirely for non-matching hosts — no per-request overhead.
 - Supported patterns: exact host (`"reddit.com"`), subdomain wildcard (`"*.reddit.com"`), path glob (`"example.com/r/*"`), catch-all (`"*"`).
 
-### Step 3.5 — Content-Access Globals
+### Step 3.5 — Content-Access Globals ✅
 
-- Expose lazily-evaluated globals for reading the current response before applying DOM operations:
+- Expose globals for reading the current response before applying DOM operations:
+  - `status_code()` → `int` — HTTP response status code
   - `page_title()` → `str` — text content of `<title>`
   - `meta_description()` → `str` — `<meta name="description">` content
-  - `meta_tags()` → `dict` — all `<meta name="…" content="…">` pairs
-  - `response_headers()` → `dict` — normalised response headers (lower-cased names)
+  - `meta_tags()` → `dict` — all `<meta name|property="…" content="…">` pairs
+  - `response_headers()` → `dict` — response headers (lower-cased names)
   - `request_headers()` → `dict` — forwarded request headers (lower-cased names)
-  - `status_code()` → `int` — HTTP response status code
-- Values are extracted once in Rust before the Starlark call; rules that never invoke these functions pay no cost.
+- Scalar globals (`status_code()`) and headers are cheap and always available; the
+  HTML metadata globals (`page_title()`, `meta_description()`, `meta_tags()`) parse
+  the body lazily on first call and memoize the result, so rules that never invoke
+  them pay no parsing cost.
 
 ## Phase 4 — Core Feature Implementation
 

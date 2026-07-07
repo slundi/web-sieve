@@ -1,9 +1,10 @@
 //! Starlark scripting engine with hot-reload support.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use glob::{MatchOptions, Pattern as GlobPattern};
 use starlark::environment::{FrozenModule, GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
@@ -29,6 +30,95 @@ thread_local! {
     static SCAN_CTX: RefCell<(Vec<ScanMatch>, usize)> = const { RefCell::new((Vec::new(), 0)) };
     /// Configured density threshold, set per `run_rules` call.
     static DENSITY_THRESHOLD: RefCell<f32> = const { RefCell::new(DEFAULT_DENSITY_THRESHOLD) };
+    /// HTTP response status code for the current `execute_rule` call, read by `status_code()`.
+    static STATUS_CODE: Cell<i64> = const { Cell::new(0) };
+    /// Forwarded request headers as `(lowercased-name, value)` pairs, read by `request_headers()`.
+    static REQUEST_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    /// Response headers as `(lowercased-name, value)` pairs, read by `response_headers()`.
+    static RESPONSE_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    /// Raw response body for the current `execute_rule` call. Used only for lazy
+    /// HTML metadata extraction — never touched unless a metadata global is called.
+    static PAGE_BODY: RefCell<Bytes> = const { RefCell::new(Bytes::new()) };
+    /// Memoized HTML metadata parse. `None` until the first of `page_title()`,
+    /// `meta_description()`, or `meta_tags()` is called within a rule invocation,
+    /// so rules that read no metadata pay no parsing cost.
+    static PAGE_META: RefCell<Option<PageMeta>> = const { RefCell::new(None) };
+}
+
+/// HTML metadata extracted lazily from the response body and memoized per rule
+/// invocation via the [`PAGE_META`] thread-local.
+#[derive(Debug, Default, Clone)]
+struct PageMeta {
+    /// Text content of the `<title>` element (empty if absent).
+    title: String,
+    /// Content of `<meta name="description">` (empty if absent).
+    description: String,
+    /// All `<meta name|property="…" content="…">` pairs, deduplicated (last wins).
+    tags: Vec<(String, String)>,
+}
+
+/// Parse the `<title>` and `<meta>` tags out of an HTML body.
+///
+/// Both the `name` and `property` attributes are treated as meta-tag keys so
+/// OpenGraph tags (`property="og:type"`) are exposed alongside standard ones.
+fn parse_page_meta(body: &[u8]) -> PageMeta {
+    let html = String::from_utf8_lossy(body);
+    let doc = scraper::Html::parse_document(&html);
+
+    let title_sel = scraper::Selector::parse("title").expect("static selector");
+    let meta_sel = scraper::Selector::parse("meta").expect("static selector");
+
+    let title = doc
+        .select(&title_sel)
+        .next()
+        .map(|e| e.text().collect::<String>().trim().to_owned())
+        .unwrap_or_default();
+
+    let mut description = String::new();
+    let mut tags: Vec<(String, String)> = Vec::new();
+    for el in doc.select(&meta_sel) {
+        let key = el
+            .value()
+            .attr("name")
+            .or_else(|| el.value().attr("property"));
+        if let (Some(key), Some(content)) = (key, el.value().attr("content")) {
+            if key.eq_ignore_ascii_case("description") {
+                description = content.to_owned();
+            }
+            tags.push((key.to_owned(), content.to_owned()));
+        }
+    }
+
+    PageMeta {
+        title,
+        description,
+        tags: dedup_last(tags),
+    }
+}
+
+/// Run `f` against the memoized [`PageMeta`], parsing the body on first access.
+fn with_page_meta<R>(f: impl FnOnce(&PageMeta) -> R) -> R {
+    PAGE_META.with(|cell| {
+        if cell.borrow().is_none() {
+            let parsed = PAGE_BODY.with(|b| parse_page_meta(&b.borrow()));
+            *cell.borrow_mut() = Some(parsed);
+        }
+        f(cell.borrow().as_ref().expect("just populated"))
+    })
+}
+
+/// Deduplicate `(key, value)` pairs by key, keeping the last value and preserving
+/// first-seen order. Guards the dict allocators against duplicate keys.
+fn dedup_last(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        if let Some(existing) = out.iter_mut().find(|(ek, _)| *ek == k) {
+            existing.1 = v;
+        } else {
+            out.push((k, v));
+        }
+    }
+    out
 }
 
 // ─── URL pattern matching ─────────────────────────────────────────────────────
@@ -161,6 +251,49 @@ fn proxy_globals(builder: &mut GlobalsBuilder) {
     fn density_threshold() -> anyhow::Result<f64> {
         Ok(DENSITY_THRESHOLD.with(|t| *t.borrow() as f64))
     }
+
+    /// Return the HTTP response status code, e.g. `200` or `404`.
+    fn status_code() -> anyhow::Result<i64> {
+        Ok(STATUS_CODE.with(|s| s.get()))
+    }
+
+    /// Return the text content of the page `<title>` element, or `""` if absent.
+    ///
+    /// Parses the HTML body on first call (memoized per rule invocation), so
+    /// rules that never read metadata incur no parsing cost.
+    fn page_title() -> anyhow::Result<String> {
+        Ok(with_page_meta(|m| m.title.clone()))
+    }
+
+    /// Return the `<meta name="description">` content, or `""` if absent.
+    fn meta_description() -> anyhow::Result<String> {
+        Ok(with_page_meta(|m| m.description.clone()))
+    }
+
+    /// Return a dict of every `<meta name|property="…" content="…">` pair.
+    ///
+    /// OpenGraph tags (`property="og:type"`) are keyed alongside standard
+    /// `name` meta tags. Duplicate keys keep the last value.
+    fn meta_tags<'v>(eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<Value<'v>> {
+        let pairs = with_page_meta(|m| m.tags.clone());
+        Ok(eval.heap().alloc(AllocDict(pairs)))
+    }
+
+    /// Return a dict of response headers with lower-cased names.
+    ///
+    /// Duplicate header names keep the last value seen.
+    fn response_headers<'v>(eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<Value<'v>> {
+        let pairs = RESPONSE_HEADERS.with(|h| h.borrow().clone());
+        Ok(eval.heap().alloc(AllocDict(pairs)))
+    }
+
+    /// Return a dict of forwarded request headers with lower-cased names.
+    ///
+    /// Duplicate header names keep the last value seen.
+    fn request_headers<'v>(eval: &mut Evaluator<'v, '_, '_>) -> anyhow::Result<Value<'v>> {
+        let pairs = REQUEST_HEADERS.with(|h| h.borrow().clone());
+        Ok(eval.heap().alloc(AllocDict(pairs)))
+    }
 }
 
 // ─── Public types ───────────────────────────────────────────────────────────
@@ -173,10 +306,18 @@ pub struct RequestCtx {
     pub host: String,
     /// Value of the `Content-Type` response header.
     pub content_type: String,
+    /// HTTP response status code.
+    pub status_code: u16,
+    /// Forwarded request headers as `(lowercased-name, value)` pairs.
+    pub request_headers: Vec<(String, String)>,
+    /// Response headers as `(lowercased-name, value)` pairs.
+    pub response_headers: Vec<(String, String)>,
     /// Scan matches from the text scanner (category → hit count).
     pub scan_matches: Vec<ScanMatch>,
     /// Byte length of the response body.
     pub content_length: usize,
+    /// Raw response body, used for lazy HTML metadata extraction.
+    pub body: Bytes,
 }
 
 /// A compiled Starlark rule file ready for evaluation.
@@ -388,11 +529,18 @@ fn execute_rule(frozen: &FrozenModule, ctx: &RequestCtx) -> Vec<RewriteOp> {
         }
     };
 
-    // Clear any leftover ops and populate the scan context for this invocation.
+    // Clear any leftover ops and populate the per-invocation context read by the
+    // content-inspection globals. HTML metadata is parsed lazily on first access,
+    // so we only stash the raw body and reset the memo here.
     PENDING_OPS.with(|ops| ops.borrow_mut().clear());
     SCAN_CTX.with(|sc| {
         *sc.borrow_mut() = (ctx.scan_matches.clone(), ctx.content_length);
     });
+    STATUS_CODE.with(|s| s.set(ctx.status_code as i64));
+    REQUEST_HEADERS.with(|h| *h.borrow_mut() = dedup_last(ctx.request_headers.clone()));
+    RESPONSE_HEADERS.with(|h| *h.borrow_mut() = dedup_last(ctx.response_headers.clone()));
+    PAGE_BODY.with(|b| *b.borrow_mut() = ctx.body.clone());
+    PAGE_META.with(|m| *m.borrow_mut() = None);
 
     let result = Module::with_temp_heap(|call_module| -> anyhow::Result<()> {
         let mut eval = Evaluator::new(&call_module);
@@ -412,8 +560,13 @@ fn execute_rule(frozen: &FrozenModule, ctx: &RequestCtx) -> Vec<RewriteOp> {
         Ok(())
     });
 
-    // Always clear the scan context after the rule runs.
+    // Always clear the per-invocation context after the rule runs.
     SCAN_CTX.with(|sc| *sc.borrow_mut() = (Vec::new(), 0));
+    STATUS_CODE.with(|s| s.set(0));
+    REQUEST_HEADERS.with(|h| h.borrow_mut().clear());
+    RESPONSE_HEADERS.with(|h| h.borrow_mut().clear());
+    PAGE_BODY.with(|b| *b.borrow_mut() = Bytes::new());
+    PAGE_META.with(|m| *m.borrow_mut() = None);
 
     if let Err(e) = result {
         tracing::warn!(error = %e, "rule execution failed");
@@ -483,8 +636,12 @@ mod tests {
             url: url.into(),
             host: "example.com".into(),
             content_type: "text/html".into(),
+            status_code: 200,
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
             scan_matches: Vec::new(),
             content_length: 0,
+            body: Bytes::new(),
         }
     }
 
@@ -734,14 +891,10 @@ def process(request):
 
     #[test]
     fn test_rule_matches_url_exact_host() {
-        let p = GlobPattern::new("example.com").unwrap();
-        assert!(rule_matches_url(
-            &[p.clone()],
-            "http://example.com/",
-            "example.com"
-        ));
+        let p = vec![GlobPattern::new("example.com").unwrap()];
+        assert!(rule_matches_url(&p, "http://example.com/", "example.com"));
         assert!(!rule_matches_url(
-            &[p],
+            &p,
             "http://www.example.com/",
             "www.example.com"
         ));
@@ -749,34 +902,26 @@ def process(request):
 
     #[test]
     fn test_rule_matches_url_subdomain_wildcard() {
-        let p = GlobPattern::new("*.example.com").unwrap();
+        let p = vec![GlobPattern::new("*.example.com").unwrap()];
         assert!(rule_matches_url(
-            &[p.clone()],
+            &p,
             "http://www.example.com/",
             "www.example.com"
         ));
         assert!(rule_matches_url(
-            &[p.clone()],
+            &p,
             "http://old.example.com/page",
             "old.example.com"
         ));
-        assert!(!rule_matches_url(
-            &[p],
-            "http://example.com/",
-            "example.com"
-        ));
+        assert!(!rule_matches_url(&p, "http://example.com/", "example.com"));
     }
 
     #[test]
     fn test_rule_matches_url_catch_all() {
-        let p = GlobPattern::new("*").unwrap();
+        let p = vec![GlobPattern::new("*").unwrap()];
+        assert!(rule_matches_url(&p, "http://anything.io/", "anything.io"));
         assert!(rule_matches_url(
-            &[p.clone()],
-            "http://anything.io/",
-            "anything.io"
-        ));
-        assert!(rule_matches_url(
-            &[p],
+            &p,
             "https://reddit.com/r/rust",
             "reddit.com"
         ));
@@ -784,14 +929,14 @@ def process(request):
 
     #[test]
     fn test_rule_matches_url_path_glob() {
-        let p = GlobPattern::new("example.com/r/*").unwrap();
+        let p = vec![GlobPattern::new("example.com/r/*").unwrap()];
         assert!(rule_matches_url(
-            &[p.clone()],
+            &p,
             "http://example.com/r/rust",
             "example.com"
         ));
         assert!(!rule_matches_url(
-            &[p],
+            &p,
             "http://example.com/other/page",
             "example.com"
         ));
@@ -896,8 +1041,12 @@ def process(request):
                 url: url.clone(),
                 host: host.to_owned(),
                 content_type: "text/html".into(),
+                status_code: 200,
+                request_headers: Vec::new(),
+                response_headers: Vec::new(),
                 scan_matches: Vec::new(),
                 content_length: 0,
+                body: Bytes::new(),
             };
             let e = engine.clone();
             let ops = tokio::task::spawn_blocking(move || e.run_rules(&c))
@@ -905,6 +1054,219 @@ def process(request):
                 .expect("spawn_blocking");
             assert_eq!(ops.len(), 1, "wildcard should match {host}: {ops:?}");
         }
+    }
+
+    // ─── Content-access global tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_dedup_last_keeps_last_value_and_order() {
+        let pairs = vec![
+            ("a".to_owned(), "1".to_owned()),
+            ("b".to_owned(), "2".to_owned()),
+            ("a".to_owned(), "3".to_owned()),
+        ];
+        assert_eq!(
+            dedup_last(pairs),
+            vec![
+                ("a".to_owned(), "3".to_owned()),
+                ("b".to_owned(), "2".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_page_meta_extracts_title_description_and_tags() {
+        let html = br#"<html><head>
+            <title>  Hello World  </title>
+            <meta name="description" content="A test page">
+            <meta property="og:type" content="article">
+            <meta name="keywords" content="a,b,c">
+        </head><body>x</body></html>"#;
+        let meta = parse_page_meta(html);
+        assert_eq!(meta.title, "Hello World");
+        assert_eq!(meta.description, "A test page");
+        assert_eq!(
+            meta.tags
+                .iter()
+                .find(|(k, _)| k == "og:type")
+                .map(|(_, v)| v.as_str()),
+            Some("article")
+        );
+        assert_eq!(
+            meta.tags
+                .iter()
+                .find(|(k, _)| k == "keywords")
+                .map(|(_, v)| v.as_str()),
+            Some("a,b,c")
+        );
+    }
+
+    #[test]
+    fn test_parse_page_meta_absent_fields_are_empty() {
+        let meta = parse_page_meta(b"<html><body>no head</body></html>");
+        assert!(meta.title.is_empty());
+        assert!(meta.description.is_empty());
+        assert!(meta.tags.is_empty());
+    }
+
+    #[test]
+    fn test_status_code_global() {
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    if status_code() == 404:
+        block_page()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.status_code = 404;
+        let ops = execute_rule(&rule.frozen, &c);
+        assert_eq!(ops.len(), 1, "404 → block_page: {ops:?}");
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
+
+        // A 200 response must not trigger the rule.
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
+        assert!(ops.is_empty(), "200 → no ops: {ops:?}");
+    }
+
+    #[test]
+    fn test_page_title_global() {
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    if page_title() == "Breaking News":
+        enable_reader_mode()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.body = Bytes::from_static(
+            b"<html><head><title>Breaking News</title></head><body>x</body></html>",
+        );
+        let ops = execute_rule(&rule.frozen, &c);
+        assert_eq!(ops.len(), 1, "title match → reader mode: {ops:?}");
+        assert!(matches!(ops[0], RewriteOp::ReaderMode));
+    }
+
+    #[test]
+    fn test_meta_description_global() {
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    if "sponsored" in meta_description():
+        block_page()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.body = Bytes::from_static(
+            b"<html><head><meta name=\"description\" content=\"this is sponsored content\"></head><body>x</body></html>",
+        );
+        let ops = execute_rule(&rule.frozen, &c);
+        assert_eq!(ops.len(), 1, "description match → block: {ops:?}");
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
+    }
+
+    #[test]
+    fn test_meta_tags_global() {
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    if meta_tags().get("og:type") == "article":
+        enable_reader_mode()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.body = Bytes::from_static(
+            b"<html><head><meta property=\"og:type\" content=\"article\"></head><body>x</body></html>",
+        );
+        let ops = execute_rule(&rule.frozen, &c);
+        assert_eq!(ops.len(), 1, "og:type=article → reader mode: {ops:?}");
+        assert!(matches!(ops[0], RewriteOp::ReaderMode));
+    }
+
+    #[test]
+    fn test_response_headers_global() {
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    h = response_headers()
+    if h.get("x-frame-options") == "DENY":
+        block_page()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.response_headers = vec![("x-frame-options".into(), "DENY".into())];
+        let ops = execute_rule(&rule.frozen, &c);
+        assert_eq!(ops.len(), 1, "header match → block: {ops:?}");
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
+    }
+
+    #[test]
+    fn test_request_headers_global() {
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    ua = request_headers().get("user-agent", "")
+    if "curl" in ua:
+        block_page()
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.request_headers = vec![("user-agent".into(), "curl/8.0".into())];
+        let ops = execute_rule(&rule.frozen, &c);
+        assert_eq!(ops.len(), 1, "user-agent match → block: {ops:?}");
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
+    }
+
+    #[test]
+    fn test_metadata_not_parsed_when_unused() {
+        // A rule that never calls a metadata global must run fine even when the
+        // body is not valid HTML — proving no eager parse occurs.
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    remove_element("div.ad")
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+
+        let mut c = ctx("http://example.com/");
+        c.body = Bytes::from_static(b"\xff\xfe not html at all");
+        let ops = execute_rule(&rule.frozen, &c);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0], RewriteOp::RemoveElement("div.ad".into()));
+    }
+
+    #[test]
+    fn test_execute_rule_clears_status_code_after_run() {
+        let f = write_tempfile("URLS = [\"example.com\"]\ndef process(request):\n    pass\n");
+        let rule = load_rule(f.path()).expect("load");
+        let mut c = ctx("http://example.com/");
+        c.status_code = 500;
+        execute_rule(&rule.frozen, &c);
+        assert_eq!(
+            STATUS_CODE.with(|s| s.get()),
+            0,
+            "status code thread-local must be reset after execute_rule"
+        );
     }
 
     #[tokio::test]

@@ -43,6 +43,21 @@ fn full_body(data: impl Into<Bytes>) -> BoxBody {
     Full::new(data.into()).map_err(|e| match e {}).boxed()
 }
 
+/// Collect a header map into `(lowercased-name, value)` pairs, skipping any value
+/// that is not valid UTF-8. Exposed to Starlark rules via `request_headers()` /
+/// `response_headers()`.
+fn header_pairs(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_owned()))
+        })
+        .collect()
+}
+
 /// Start the proxy listener and serve connections forever.
 ///
 /// Binds to `addr`, accepts TCP connections, and dispatches each to
@@ -320,8 +335,12 @@ async fn do_mitm(
                             url: req_url.clone(),
                             host: host.clone(),
                             content_type: content_type.clone(),
+                            status_code: resp_parts.status.as_u16(),
+                            request_headers: header_pairs(&req_parts.headers),
+                            response_headers: header_pairs(&resp_parts.headers),
                             scan_matches,
                             content_length,
+                            body: resp_bytes.clone(),
                         };
                         let cosmetic_css = if is_html {
                             blocker.cosmetic_css_for(&host).await
@@ -435,6 +454,9 @@ async fn forward_http(
     headers::strip_hop_by_hop(&mut parts.headers);
     headers::strip_accept_encoding(&mut parts.headers);
 
+    // Capture forwarded request headers before `parts` is moved into the upstream request.
+    let request_headers = header_pairs(&parts.headers);
+
     let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
 
     let tcp = TcpStream::connect((host.as_str(), port)).await?;
@@ -496,8 +518,12 @@ async fn forward_http(
             url: uri.to_string(),
             host: host.clone(),
             content_type: content_type.clone(),
+            status_code: resp_parts.status.as_u16(),
+            request_headers,
+            response_headers: header_pairs(&resp_parts.headers),
             scan_matches,
             content_length,
+            body: resp_bytes.clone(),
         };
         let cosmetic_css = if is_html {
             blocker.cosmetic_css_for(&host).await

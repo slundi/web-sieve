@@ -64,7 +64,6 @@ URLS = [
 | `request["url"]`          | `str` | Full request URL, e.g. `"https://reddit.com/r/rust"`       |
 | `request["host"]`         | `str` | Hostname without port, e.g. `"reddit.com"`                 |
 | `request["content_type"]` | `str` | Response `Content-Type`, e.g. `"text/html; charset=utf-8"` |
-| `request["status_code"]`  | `int` | HTTP response status code, e.g. `200`                      |
 
 Use these fields to branch on URL structure or content type:
 
@@ -72,7 +71,7 @@ Use these fields to branch on URL structure or content type:
 URLS = ["example.com", "*.example.com"]
 
 def process(request):
-    if request["status_code"] != 200:
+    if status_code() != 200:
         return
     if "text/html" not in request["content_type"]:
         return
@@ -83,14 +82,17 @@ def process(request):
 ## Content-inspection globals
 
 These functions are called inside `process()` to read the page being processed.
-They are evaluated lazily by Rust before the Starlark call, so they have no
-parsing overhead in rules that never call them.
+The scalar globals (`status_code()`) are always cheap; the HTML metadata globals
+(`page_title()`, `meta_description()`, `meta_tags()`) parse the response body
+lazily on first call and memoize the result, so rules that never call them incur
+no parsing cost.
 
 ```python
+status_code()       # → int   — HTTP response status code, e.g. 200
 page_title()        # → str   — <title> element text, empty string if absent
 meta_description()  # → str   — content of <meta name="description">, empty if absent
-meta_tags()         # → dict  # all <meta name="…" content="…"> as {name: content}
-response_headers()  # → dict  # normalised response headers, lower-cased names
+meta_tags()         # → dict  # all <meta name|property="…" content="…"> as {name: content}
+response_headers()  # → dict  # response headers, lower-cased names
 request_headers()   # → dict  # forwarded request headers, lower-cased names
 ```
 
@@ -180,7 +182,7 @@ URLS = [
 def process(request):
     if "text/html" not in request["content_type"]:
         return
-    if request["status_code"] != 200:
+    if status_code() != 200:
         return
     enable_reader_mode()
 ```
@@ -229,7 +231,7 @@ _CSS = """
 """
 
 def process(request):
-    if request["status_code"] == 200:
+    if status_code() == 200:
         inject_style(_CSS)
 ```
 
@@ -297,8 +299,8 @@ common styles in one place.
 JSON, CSS, and image URLs. Always check `"text/html" in request["content_type"]`
 before DOM operations.
 
-**Guard on `status_code`** — avoid modifying error pages inadvertently; check
-`request["status_code"] == 200` for rules that assume a valid document.
+**Guard on `status_code()`** — avoid modifying error pages inadvertently; check
+`status_code() == 200` for rules that assume a valid document.
 
 **Keep rules focused** — one rule file per site or concern. The alphabetical
 load order lets you control sequencing with numeric prefixes
