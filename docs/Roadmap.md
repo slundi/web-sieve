@@ -94,9 +94,9 @@
 
 ### Step 4.2 — Universal Reader Mode ✅
 
-- [x] Integrate a text-density extraction engine (Rust port of Mozilla Readability).
-- [x] Wrap extracted content in a minimal, uniform HTML/CSS template.
-- [x] Starlark hook to forward saved URLs to read-later services (Shiori, Pocket) via webhook.
+- Integrate a text-density extraction engine (Rust port of Mozilla Readability).
+- Wrap extracted content in a minimal, uniform HTML/CSS template.
+- Starlark hook to forward saved URLs to read-later services (Shiori, Pocket) via webhook.
 
 ### Step 4.3 — Manga/Manhwa Pipeline & Image Proxying
 

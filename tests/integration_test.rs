@@ -61,6 +61,7 @@ async fn start_proxy() -> SocketAddr {
     let ca = CertificateAuthority::load_or_create(
         &dir.path().join("ca.crt"),
         &dir.path().join("ca.key"),
+        2048,
     )
     .expect("CA");
 

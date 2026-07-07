@@ -4,12 +4,14 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use glob::{MatchOptions, Pattern as GlobPattern};
 use starlark::environment::{FrozenModule, GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::Value;
 use starlark::values::dict::AllocDict;
+use starlark::values::list::ListRef;
 use starlark::values::none::NoneType;
 use tokio::sync::RwLock;
 
@@ -27,6 +29,43 @@ thread_local! {
     static SCAN_CTX: RefCell<(Vec<ScanMatch>, usize)> = const { RefCell::new((Vec::new(), 0)) };
     /// Configured density threshold, set per `run_rules` call.
     static DENSITY_THRESHOLD: RefCell<f32> = const { RefCell::new(DEFAULT_DENSITY_THRESHOLD) };
+}
+
+// ─── URL pattern matching ─────────────────────────────────────────────────────
+
+const URL_MATCH_OPTS: MatchOptions = MatchOptions {
+    case_sensitive: false,
+    require_literal_separator: false,
+    require_literal_leading_dot: false,
+};
+
+/// Extract `host[/path]` from a full URL, stripping scheme, query, and fragment.
+fn strip_host_path(url: &str) -> String {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let without_fragment = without_scheme.split('#').next().unwrap_or(without_scheme);
+    without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment)
+        .to_owned()
+}
+
+/// Return `true` if any pattern in `patterns` matches the given URL.
+///
+/// Patterns without a `/` are matched against the host only; patterns that
+/// contain a `/` are matched against `host/path` (query and fragment stripped).
+fn rule_matches_url(patterns: &[GlobPattern], url: &str, host: &str) -> bool {
+    patterns.iter().any(|p| {
+        let target = if p.as_str().contains('/') {
+            strip_host_path(url)
+        } else {
+            host.to_owned()
+        };
+        p.matches_with(&target, URL_MATCH_OPTS)
+    })
 }
 
 // ─── Starlark global functions ──────────────────────────────────────────────
@@ -141,11 +180,14 @@ pub struct RequestCtx {
 }
 
 /// A compiled Starlark rule file ready for evaluation.
+#[derive(Debug)]
 struct LoadedRule {
     /// Source path, used for reload / eviction logic.
     path: PathBuf,
     /// The frozen module that results from evaluating the `.star` file.
     frozen: FrozenModule,
+    /// Compiled glob patterns from the script's top-level `URLS` list.
+    url_patterns: Vec<GlobPattern>,
 }
 
 /// The scripting engine that loads, hot-reloads, and executes Starlark rule files.
@@ -224,14 +266,19 @@ impl ScriptEngine {
         Ok(engine)
     }
 
-    /// Execute all loaded rules against `ctx` and return the accumulated [`RewriteOp`]s.
+    /// Execute all loaded rules whose `URLS` match `ctx` and return the accumulated [`RewriteOp`]s.
     ///
-    /// This method is synchronous and may be called from a `spawn_blocking` context.
+    /// Rules whose URL patterns do not match `ctx.url` / `ctx.host` are skipped without
+    /// entering the Starlark interpreter.  This method is synchronous and may be called
+    /// from a `spawn_blocking` context.
     pub fn run_rules(&self, ctx: &RequestCtx) -> Vec<RewriteOp> {
         let rules = self.rules.blocking_read();
         DENSITY_THRESHOLD.with(|t| *t.borrow_mut() = self.density_threshold);
         let mut all_ops = Vec::new();
         for rule in rules.iter() {
+            if !rule_matches_url(&rule.url_patterns, &ctx.url, &ctx.host) {
+                continue;
+            }
             let ops = execute_rule(&rule.frozen, ctx);
             all_ops.extend(ops);
         }
@@ -248,6 +295,9 @@ impl ScriptEngine {
 // ─── Private helpers ─────────────────────────────────────────────────────────
 
 /// Compile a `.star` file into a [`LoadedRule`].
+///
+/// Returns an error if the file cannot be read, fails to parse or evaluate, is
+/// missing the required top-level `URLS` list, or contains an invalid glob pattern.
 fn load_rule(path: &Path) -> anyhow::Result<LoadedRule> {
     use anyhow::Context as _;
 
@@ -274,10 +324,57 @@ fn load_rule(path: &Path) -> anyhow::Result<LoadedRule> {
             .map_err(|e| anyhow::anyhow!("freeze error in {}: {:?}", filename, e))
     })?;
 
+    let url_patterns = extract_url_patterns(&frozen, &filename)?;
+
     Ok(LoadedRule {
         path: path.to_path_buf(),
         frozen,
+        url_patterns,
     })
+}
+
+/// Read the mandatory `URLS` list from a frozen module and compile each entry into
+/// a [`GlobPattern`].
+///
+/// Returns an error if `URLS` is absent, is not a list of strings, is empty, or
+/// contains a pattern that cannot be compiled.
+fn extract_url_patterns(frozen: &FrozenModule, filename: &str) -> anyhow::Result<Vec<GlobPattern>> {
+    let urls_val = frozen.get("URLS").map_err(|_| {
+        anyhow::anyhow!(
+            "'{}' is missing required top-level URLS list — add e.g. URLS = [\"*\"] to match all hosts",
+            filename
+        )
+    })?;
+
+    let strings: anyhow::Result<Vec<String>> = Module::with_temp_heap(|module| {
+        let v = module.heap().access_owned_frozen_value(&urls_val);
+        let list = ListRef::from_value(v)
+            .ok_or_else(|| anyhow::anyhow!("URLS in '{}' must be a list of strings", filename))?;
+        if list.is_empty() {
+            return Err(anyhow::anyhow!(
+                "URLS in '{}' must not be empty — use [\"*\"] to match all hosts",
+                filename
+            ));
+        }
+        list.iter()
+            .map(|item| {
+                item.unpack_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("URLS entries in '{}' must be strings", filename)
+                    })
+                    .map(str::to_owned)
+            })
+            .collect()
+    });
+
+    strings?
+        .iter()
+        .map(|s| {
+            GlobPattern::new(s).map_err(|e| {
+                anyhow::anyhow!("invalid URL pattern '{}' in '{}': {}", s, filename, e)
+            })
+        })
+        .collect()
 }
 
 /// Call the `process(request)` function in a frozen module and collect the
@@ -342,6 +439,7 @@ async fn handle_notify_event(event: notify::Event, rules: &RwLock<Vec<LoadedRule
                         let mut locked = rules.write().await;
                         if let Some(existing) = locked.iter_mut().find(|r| r.path == *path) {
                             existing.frozen = new_rule.frozen;
+                            existing.url_patterns = new_rule.url_patterns;
                         } else {
                             locked.push(new_rule);
                         }
@@ -392,23 +490,44 @@ mod tests {
 
     #[test]
     fn test_load_rule_with_valid_script() {
-        let f = write_tempfile("def process(request):\n    pass\n");
+        let f = write_tempfile("URLS = [\"example.com\"]\ndef process(request):\n    pass\n");
         let rule = load_rule(f.path()).expect("load_rule should succeed");
         assert_eq!(rule.path, f.path());
     }
 
     #[test]
     fn test_load_rule_missing_process_fn() {
-        let f = write_tempfile("x = 1\n");
+        let f = write_tempfile("URLS = [\"example.com\"]\nx = 1\n");
         let rule = load_rule(f.path()).expect("load succeeds even without process");
         let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
         assert!(ops.is_empty());
     }
 
     #[test]
+    fn test_load_rule_missing_urls_fails() {
+        let f = write_tempfile("def process(request):\n    pass\n");
+        let err = load_rule(f.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("URLS"),
+            "error should mention URLS: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_rule_empty_urls_fails() {
+        let f = write_tempfile("URLS = []\ndef process(request):\n    pass\n");
+        let err = load_rule(f.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "error should mention empty: {err}"
+        );
+    }
+
+    #[test]
     fn test_execute_rule_collects_ops() {
         let f = write_tempfile(
             r#"
+URLS = ["example.com"]
 def process(request):
     remove_element("div.foo")
 "#,
@@ -423,6 +542,7 @@ def process(request):
     fn test_execute_rule_enable_reader_mode() {
         let f = write_tempfile(
             r#"
+URLS = ["example.com"]
 def process(request):
     enable_reader_mode()
 "#,
@@ -437,6 +557,7 @@ def process(request):
     fn test_execute_rule_block_page() {
         let f = write_tempfile(
             r#"
+URLS = ["example.com"]
 def process(request):
     block_page()
 "#,
@@ -451,6 +572,7 @@ def process(request):
     fn test_execute_rule_scan_matches_empty() {
         let f = write_tempfile(
             r#"
+URLS = ["example.com"]
 def process(request):
     m = scan_matches()
     if len(m) != 0:
@@ -466,6 +588,7 @@ def process(request):
     fn test_execute_rule_scan_matches_with_data() {
         let f = write_tempfile(
             r#"
+URLS = ["example.com"]
 def process(request):
     m = scan_matches()
     if m.get("violence", 0) > 5:
@@ -490,6 +613,7 @@ def process(request):
     fn test_execute_rule_density_threshold_not_reached() {
         let f = write_tempfile(
             r#"
+URLS = ["example.com"]
 def process(request):
     m = scan_matches()
     n = scan_content_length()
@@ -517,6 +641,7 @@ def process(request):
     fn test_execute_rule_density_threshold_reached() {
         let f = write_tempfile(
             r#"
+URLS = ["example.com"]
 def process(request):
     m = scan_matches()
     n = scan_content_length()
@@ -542,6 +667,7 @@ def process(request):
     fn test_execute_rule_density_threshold_function() {
         let f = write_tempfile(
             r#"
+URLS = ["example.com"]
 def process(request):
     t = density_threshold()
     if t > 0.005:
@@ -570,7 +696,10 @@ def process(request):
         ] {
             std::fs::write(
                 tmp.path().join(name),
-                format!("def process(request):\n    remove_element({})\n", selector),
+                format!(
+                    "URLS = [\"example.com\"]\ndef process(request):\n    remove_element({})\n",
+                    selector
+                ),
             )
             .expect("write");
         }
@@ -599,6 +728,183 @@ def process(request):
             RewriteOp::RemoveElement("c".into()),
             "third op must come from c.star"
         );
+    }
+
+    // ─── URL scoping tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rule_matches_url_exact_host() {
+        let p = GlobPattern::new("example.com").unwrap();
+        assert!(rule_matches_url(
+            &[p.clone()],
+            "http://example.com/",
+            "example.com"
+        ));
+        assert!(!rule_matches_url(
+            &[p],
+            "http://www.example.com/",
+            "www.example.com"
+        ));
+    }
+
+    #[test]
+    fn test_rule_matches_url_subdomain_wildcard() {
+        let p = GlobPattern::new("*.example.com").unwrap();
+        assert!(rule_matches_url(
+            &[p.clone()],
+            "http://www.example.com/",
+            "www.example.com"
+        ));
+        assert!(rule_matches_url(
+            &[p.clone()],
+            "http://old.example.com/page",
+            "old.example.com"
+        ));
+        assert!(!rule_matches_url(
+            &[p],
+            "http://example.com/",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_rule_matches_url_catch_all() {
+        let p = GlobPattern::new("*").unwrap();
+        assert!(rule_matches_url(
+            &[p.clone()],
+            "http://anything.io/",
+            "anything.io"
+        ));
+        assert!(rule_matches_url(
+            &[p],
+            "https://reddit.com/r/rust",
+            "reddit.com"
+        ));
+    }
+
+    #[test]
+    fn test_rule_matches_url_path_glob() {
+        let p = GlobPattern::new("example.com/r/*").unwrap();
+        assert!(rule_matches_url(
+            &[p.clone()],
+            "http://example.com/r/rust",
+            "example.com"
+        ));
+        assert!(!rule_matches_url(
+            &[p],
+            "http://example.com/other/page",
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn test_rule_matches_url_multiple_patterns() {
+        let patterns: Vec<GlobPattern> = ["reddit.com", "*.reddit.com"]
+            .iter()
+            .map(|s| GlobPattern::new(s).unwrap())
+            .collect();
+        assert!(rule_matches_url(
+            &patterns,
+            "http://reddit.com/",
+            "reddit.com"
+        ));
+        assert!(rule_matches_url(
+            &patterns,
+            "http://old.reddit.com/",
+            "old.reddit.com"
+        ));
+        assert!(!rule_matches_url(
+            &patterns,
+            "http://other.com/",
+            "other.com"
+        ));
+    }
+
+    #[test]
+    fn test_strip_host_path_strips_scheme_query_fragment() {
+        assert_eq!(
+            strip_host_path("https://example.com/r/rust?sort=new#top"),
+            "example.com/r/rust"
+        );
+        assert_eq!(
+            strip_host_path("http://example.com/path"),
+            "example.com/path"
+        );
+        assert_eq!(strip_host_path("example.com/path"), "example.com/path");
+    }
+
+    #[tokio::test]
+    async fn test_run_rules_skips_non_matching_url() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("rule.star"),
+            "URLS = [\"other.com\"]\ndef process(request):\n    block_page()\n",
+        )
+        .expect("write");
+
+        let engine = ScriptEngine::new(tmp.path().to_path_buf(), 0.01)
+            .await
+            .expect("ScriptEngine::new");
+
+        let c = ctx("http://example.com/");
+        let ops = tokio::task::spawn_blocking(move || engine.run_rules(&c))
+            .await
+            .expect("spawn_blocking");
+        assert!(
+            ops.is_empty(),
+            "non-matching URL must produce no ops: {ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_rules_applies_matching_url() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("rule.star"),
+            "URLS = [\"example.com\"]\ndef process(request):\n    block_page()\n",
+        )
+        .expect("write");
+
+        let engine = ScriptEngine::new(tmp.path().to_path_buf(), 0.01)
+            .await
+            .expect("ScriptEngine::new");
+
+        let c = ctx("http://example.com/");
+        let ops = tokio::task::spawn_blocking(move || engine.run_rules(&c))
+            .await
+            .expect("spawn_blocking");
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
+    }
+
+    #[tokio::test]
+    async fn test_run_rules_wildcard_matches_all_hosts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("rule.star"),
+            "URLS = [\"*\"]\ndef process(request):\n    block_page()\n",
+        )
+        .expect("write");
+
+        let engine = ScriptEngine::new(tmp.path().to_path_buf(), 0.01)
+            .await
+            .expect("ScriptEngine::new");
+
+        for host in ["example.com", "reddit.com", "news.ycombinator.com"] {
+            let url = format!("http://{host}/");
+            let c = RequestCtx {
+                url: url.clone(),
+                host: host.to_owned(),
+                content_type: "text/html".into(),
+                scan_matches: Vec::new(),
+                content_length: 0,
+            };
+            let e = engine.clone();
+            let ops = tokio::task::spawn_blocking(move || e.run_rules(&c))
+                .await
+                .expect("spawn_blocking");
+            assert_eq!(ops.len(), 1, "wildcard should match {host}: {ops:?}");
+        }
     }
 
     #[tokio::test]
