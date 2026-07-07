@@ -47,7 +47,7 @@
 
 - Transparent forwarding of upstream headers, session cookies, and state to guarantee seamless authentication on intercepted sites.
 
-## Phase 3 — Starlark Scripting Engine & HTML Pipeline ✅
+## Phase 3 — Starlark Scripting Engine & HTML Pipeline
 
 **Objective:** Embed a scripting engine and build a low-latency streaming HTML modification pipeline.
 
@@ -64,6 +64,24 @@
 ### Step 3.3 — Dynamic Script Hot-Reloading ✅
 
 - Use the `notify` crate to watch rule files and reload Starlark scripts on modification without restarting the proxy.
+
+### Step 3.4 — Mandatory URL Scoping
+
+- Require every `.star` file to declare a top-level `URLS` list of glob patterns (host and optional path).
+- Engine reads `URLS` from the frozen module at load time; rules with a missing or empty `URLS` fail to load with a clear error.
+- `run_rules` skips the Starlark interpreter entirely for non-matching hosts — no per-request overhead.
+- Supported patterns: exact host (`"reddit.com"`), subdomain wildcard (`"*.reddit.com"`), path glob (`"example.com/r/*"`), catch-all (`"*"`).
+
+### Step 3.5 — Content-Access Globals
+
+- Expose lazily-evaluated globals for reading the current response before applying DOM operations:
+  - `page_title()` → `str` — text content of `<title>`
+  - `meta_description()` → `str` — `<meta name="description">` content
+  - `meta_tags()` → `dict` — all `<meta name="…" content="…">` pairs
+  - `response_headers()` → `dict` — normalised response headers (lower-cased names)
+  - `request_headers()` → `dict` — forwarded request headers (lower-cased names)
+  - `status_code()` → `int` — HTTP response status code
+- Values are extracted once in Rust before the Starlark call; rules that never invoke these functions pay no cost.
 
 ## Phase 4 — Core Feature Implementation
 
