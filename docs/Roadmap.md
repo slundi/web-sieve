@@ -111,6 +111,41 @@
 - Starlark recipes to scrape torrent/DDL sites into structured datasets.
 - Re-render as clean tabular HTML with webhook buttons (e.g. send magnet links directly to qBittorrent on click).
 
+### Step 4.5 — Weather Forecast Homogenisation
+
+- Starlark schemas extracting forecast data (temperature, conditions, hourly/daily series) from popular weather providers.
+- Re-render into a single uniform, low-clutter forecast template inspired by minimalist clients like Breezy Weather.
+
+### Step 4.6 — Web Radio Handling
+
+- Detect and extract stream endpoints and station metadata (now-playing, bitrate, genre) from web radio directories and player pages.
+- Expose a consistent lightweight player UI and forward stream URLs to external players/webhooks.
+
+### Step 4.7 — Homogeneous Shopping UI
+
+- Starlark schemas normalising product listings (title, price, availability, ratings, images) across heterogeneous e-commerce sites.
+- Re-render into a uniform product/catalogue template, stripping tracking widgets and promotional clutter.
+
+### Step 4.8 — Homogeneous Wiki UI
+
+- Extract article body, table of contents, and metadata from wiki engines (MediaWiki, DokuWiki, etc.).
+- Present a consistent, distraction-free reading template with unified typography and navigation.
+
+### Step 4.9 — Homogeneous Social Network UI
+
+- Starlark schemas targeting feed/post structures (author, content, timestamp, media, engagement) across social platforms.
+- Re-render into a uniform timeline template, removing algorithmic clutter and non-content chrome.
+
+### Step 4.10 — Git Platform Homogenisation
+
+- Schemas for Gitea, Forgejo, GitHub, Codeberg, and similar forges covering repository views, file trees, commits, issues, and pull requests.
+- Re-render into a single consistent repository-browsing template regardless of the upstream forge.
+
+### Step 4.11 — Search Engine Homogenisation
+
+- Extract organic result sets (title, URL, snippet) from Google, DuckDuckGo, Bing, and others.
+- Re-render into a uniform results template, discarding ads, trackers, and interstitial clutter.
+
 ## Phase 5 — Content Inspection & Safety Controls ✅
 
 **Objective:** Deep semantic inspection for parental controls and anti-phishing.
@@ -160,9 +195,12 @@
 ### Step 6.5 — Static Asset Serving & Local Proxy Endpoint
 
 - Proxy intercepts requests to `webprism.local` by hostname match — no DNS or `/etc/hosts` entry required.
-- Assets (`css`, `js`, `fonts`, `scripts`, `templates`) live in the XDG data directory so users can add or override files.
-- Prefer inlining assets into templates to avoid extra round-trips; the XDG directory is also served for files that cannot be inlined.
-- Extend the `notify` watcher to cover the full XDG asset directory.
+- Two asset sources, both served under `webprism.local`:
+  - **Shared assets** (`css`, `js`, `fonts`, `scripts`, `templates`) live in the XDG data directory so users can add or override files, served at `webprism.local/assets/…`.
+  - **Per-script assets** ship alongside a community script in its own folder (e.g. `rules/<script>/` containing the `.star` plus `icon`, `css`, `js`), served under a namespaced path `webprism.local/assets/<script>/…`.
+  - Per-script assets take precedence over shared assets for namespaced references.
+- Prefer inlining assets into templates to avoid extra round-trips; both directories are also served for files that cannot be inlined.
+- Extend the `notify` watcher to cover both the XDG asset directory and per-script asset folders under the rules directory.
 - CORS: default same-origin (`webprism.local` only); configurable `Access-Control-Allow-Origin` allowlist for cross-origin use.
 
 ## Ideas
