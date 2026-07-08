@@ -9,14 +9,142 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::net::TcpListener;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use web_sieve::filter::AdBlockEngine;
 use web_sieve::proxy::ca::CertificateAuthority;
 use web_sieve::proxy::fingerprint::FingerprintProfiles;
 use web_sieve::proxy::tls::load_system_root_store;
 use web_sieve::scanner::TextScanner;
 use web_sieve::scripting::ScriptEngine;
+
+/// Install the default rustls crypto provider exactly once per test binary.
+fn setup_crypto() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+/// Generate a self-signed leaf certificate for `localhost`.
+fn make_localhost_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let key = KeyPair::generate().expect("keypair");
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "localhost");
+    params.distinguished_name = dn;
+    params.subject_alt_names = vec![SanType::DnsName(
+        "localhost".try_into().expect("valid DNS name"),
+    )];
+    let cert = params.self_signed(&key).expect("self-signed");
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+    (cert_der, key_der)
+}
+
+/// Start an HTTPS origin serving `text/plain` "OK" for any request.  Returns
+/// the bound address and the DER-encoded leaf certificate so the proxy can
+/// trust it.
+async fn start_https_origin() -> (SocketAddr, CertificateDer<'static>) {
+    setup_crypto();
+    let (cert_der, key_der) = make_localhost_cert();
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .expect("server config");
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let _ = server_http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(tls),
+                        service_fn(|_req: Request<Incoming>| async move {
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(hyper::header::CONTENT_TYPE, "text/plain")
+                                    .body(
+                                        http_body_util::Full::new(Bytes::from_static(b"OK"))
+                                            .map_err(|e| match e {})
+                                            .boxed(),
+                                    )
+                                    .expect("response"),
+                            )
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+
+    (addr, cert_der)
+}
+
+/// Start the web-sieve proxy on an ephemeral port with a root store that
+/// trusts `extra_root` (typically the origin's self-signed cert). Returns
+/// the proxy address and its CA certificate in PEM form.
+async fn start_proxy_with_extra_root(extra_root: CertificateDer<'static>) -> (SocketAddr, String) {
+    setup_crypto();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca = CertificateAuthority::load_or_create(
+        &dir.path().join("ca.crt"),
+        &dir.path().join("ca.key"),
+        2048,
+    )
+    .expect("CA");
+    let ca_pem = ca.ca_cert_pem().to_owned();
+
+    let rules_dir = dir.path().join("rules");
+    let engine = ScriptEngine::new(rules_dir, 0.01)
+        .await
+        .expect("scripting engine");
+
+    let lists_dir = dir.path().join("lists");
+    let blocker = AdBlockEngine::new(lists_dir)
+        .await
+        .expect("ad-block engine");
+
+    let dicts_dir = dir.path().join("dicts");
+    let scanner = TextScanner::new(dicts_dir).await.expect("text scanner");
+
+    // Keep tempdir alive for the duration of the test.
+    std::mem::forget(dir);
+
+    let mut root_store = RootCertStore::empty();
+    root_store.add(extra_root).expect("add root cert");
+    let profiles = Arc::new(FingerprintProfiles::new(root_store).expect("fingerprint profiles"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let proxy_addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    tokio::spawn(async move {
+        web_sieve::proxy::run(proxy_addr, ca, profiles, engine, blocker, scanner)
+            .await
+            .expect("proxy run");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    (proxy_addr, ca_pem)
+}
 
 /// Start a minimal HTTP echo server and return its bound address.
 async fn start_echo_server() -> SocketAddr {
@@ -132,4 +260,91 @@ async fn test_plain_http_proxy_round_trip() {
 
     let body = resp.collect().await.expect("collect body").to_bytes();
     assert_eq!(body, Bytes::from_static(b"OK"));
+}
+
+/// End-to-end HTTP/2 test: MITM the CONNECT tunnel, negotiate `h2` via ALPN
+/// on the browser↔proxy leg, and drive an HTTP/2 request through it.
+///
+/// This is the guard for [Roadmap 6.3]: it fails if the leaf `ServerConfig`
+/// stops advertising `h2` or if `do_mitm` regresses to hard-wired HTTP/1.1.
+#[tokio::test]
+async fn test_mitm_negotiates_http2_via_alpn() {
+    let (origin_addr, origin_cert) = start_https_origin().await;
+    let (proxy_addr, ca_pem) = start_proxy_with_extra_root(origin_cert).await;
+
+    // Client trusts the proxy's CA and advertises h2/http/1.1.
+    let mut client_roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+        client_roots
+            .add(cert.expect("valid cert in CA PEM"))
+            .expect("add root");
+    }
+    let mut client_config = ClientConfig::builder()
+        .with_root_certificates(client_roots)
+        .with_no_client_auth();
+    client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let connector = TlsConnector::from(Arc::new(client_config));
+
+    // Open the CONNECT tunnel via HTTP/1.1 (browsers CONNECT to proxies over h1).
+    let tcp = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .expect("h1 handshake with proxy");
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+
+    let authority = format!("localhost:{}", origin_addr.port());
+    let connect_req = Request::builder()
+        .method(hyper::Method::CONNECT)
+        .uri(&authority)
+        .body(Empty::<Bytes>::new())
+        .expect("CONNECT request");
+    let resp = sender
+        .send_request(connect_req)
+        .await
+        .expect("CONNECT send");
+    assert_eq!(resp.status(), StatusCode::OK, "CONNECT should return 200");
+
+    let upgraded = hyper::upgrade::on(resp)
+        .await
+        .expect("upgrade CONNECT tunnel");
+
+    // TLS handshake through the tunnel — the proxy MITMs with a leaf for `localhost`.
+    let server_name = ServerName::try_from("localhost").expect("valid server name");
+    let tls_stream = connector
+        .connect(server_name, TokioIo::new(upgraded))
+        .await
+        .expect("client-side TLS handshake");
+
+    // ALPN must have selected h2 — this is the core assertion for 6.3.
+    let alpn = tls_stream.get_ref().1.alpn_protocol();
+    assert_eq!(
+        alpn,
+        Some(&b"h2"[..]),
+        "expected HTTP/2 negotiated via ALPN, got {alpn:?}"
+    );
+
+    // Drive an HTTP/2 request over the MITM'd tunnel.
+    let (mut h2_sender, h2_conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
+            .await
+            .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+
+    let req = Request::builder()
+        .method(hyper::Method::GET)
+        .uri("/")
+        .header(hyper::header::HOST, &authority)
+        .body(Empty::<Bytes>::new())
+        .expect("h2 request");
+    let resp = h2_sender.send_request(req).await.expect("h2 send");
+    assert_eq!(resp.status(), StatusCode::OK, "h2 GET / should return 200");
+
+    let body = resp.collect().await.expect("collect h2 body").to_bytes();
+    assert_eq!(body, Bytes::from_static(b"OK"), "h2 body must be 'OK'");
 }

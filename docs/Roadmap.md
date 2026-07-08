@@ -188,11 +188,19 @@
 - Ensure large binary assets (images, video streams) bypass the heavy processing pipeline entirely.
 - Profile memory mapping and async task scheduling; optimise only after profiling.
 
-### Step 6.3 — HTTP/2 Browser↔Proxy Protocol
+### Step 6.3 — HTTP/2 Browser↔Proxy Protocol ✅
 
 - HTTP/2 on the browser→proxy leg only (`hyper`); proxy→upstream remains independent.
 - Advertise `h2` in ALPN on the listening `tokio-rustls` socket; negotiate HTTP/1.1 as fallback.
 - Each concurrent HTTP/2 stream is dispatched as its own `tokio` task; `lol-html` rewriting runs per-stream in parallel.
+- MITM leaf `ServerConfig` sets `alpn_protocols = ["h2", "http/1.1"]`. After
+  TLS termination in `do_mitm`, `hyper_util::server::conn::auto::Builder`
+  picks h2 or h1 from the negotiated ALPN in a single call site; the
+  `TokioExecutor` drives hyper's per-stream dispatch.
+- Per-request logic moved out of the service closure into a top-level
+  `handle_mitm_request`, so both protocol drivers share one implementation.
+- CONNECT requests inside the MITM'd stream (nested MITM, extended-CONNECT
+  for WebSockets-over-h2, MASQUE, …) are answered with `501 Not Implemented`.
 
 ### Step 6.4 — Minijinja Template Engine
 

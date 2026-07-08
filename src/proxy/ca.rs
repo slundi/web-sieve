@@ -155,10 +155,15 @@ impl CertificateAuthority {
         let cert_der = CertificateDer::from(leaf_cert.der().to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
 
-        let server_config = ServerConfig::builder()
+        let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)
             .map_err(ProxyError::Tls)?;
+
+        // Advertise HTTP/2 first, HTTP/1.1 second. The MITM leg negotiates the
+        // browser↔proxy protocol via ALPN; clients that do not offer `h2` fall
+        // back to `http/1.1` seamlessly.
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         Ok(server_config)
     }
@@ -250,6 +255,29 @@ mod tests {
         let (ca, _dir) = temp_ca();
         let cfg = ca.server_config("example.com").expect("server config");
         let _clone = Arc::clone(&cfg);
+    }
+
+    #[test]
+    fn test_server_config_advertises_h2_and_http11_alpn() {
+        let (ca, _dir) = temp_ca();
+        let cfg = ca.server_config("example.com").expect("server config");
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "leaf ServerConfig must advertise `h2` first, then `http/1.1`"
+        );
+    }
+
+    #[test]
+    fn test_server_config_alpn_h2_ordered_before_http11() {
+        // Regression guard: ALPN preference is order-sensitive. Rustls picks
+        // the server's first match among the client's offers, so h2 must lead.
+        let (ca, _dir) = temp_ca();
+        let cfg = ca
+            .server_config("ordered.example.com")
+            .expect("server config");
+        let first = cfg.alpn_protocols.first().expect("at least one protocol");
+        assert_eq!(first.as_slice(), b"h2", "h2 must be first in ALPN list");
     }
 
     #[test]

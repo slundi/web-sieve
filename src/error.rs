@@ -21,6 +21,13 @@ pub enum ProxyError {
     #[error("HTTP error: {0}")]
     Http(#[from] hyper::Error),
 
+    /// An error surfaced by hyper's server connection driver (h1/h2 auto).
+    ///
+    /// Wrapped as a string because `hyper_util`'s auto builder returns a
+    /// boxed error rather than a concrete `hyper::Error`.
+    #[error("server connection error: {0}")]
+    ServerConnection(String),
+
     /// An invalid or missing host in the CONNECT request.
     #[error("invalid CONNECT authority: {0}")]
     InvalidAuthority(String),
@@ -71,5 +78,11 @@ mod tests {
     fn test_proxy_error_display_rewriting() {
         let err = ProxyError::Rewriting("selector error".to_string());
         assert!(err.to_string().contains("rewriting error"));
+    }
+
+    #[test]
+    fn test_proxy_error_display_server_connection() {
+        let err = ProxyError::ServerConnection("h2 stream closed".to_string());
+        assert!(err.to_string().contains("server connection error"));
     }
 }

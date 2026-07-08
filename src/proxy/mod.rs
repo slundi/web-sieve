@@ -18,7 +18,8 @@ use hyper::client::conn::http1 as client_http1;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
 use tokio::net::{TcpListener, TcpStream};
@@ -42,6 +43,18 @@ fn empty_body() -> BoxBody {
 /// Convert a byte slice to a [`BoxBody`].
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
     Full::new(data.into()).map_err(|e| match e {}).boxed()
+}
+
+/// Response returned when a CONNECT request appears inside a MITM'd browser↔proxy
+/// stream (nested MITM, extended-CONNECT for WebSockets-over-h2, MASQUE, …).
+///
+/// Kept as a pure function so the 501 branch of [`handle_mitm_request`] can be
+/// asserted in isolation without spinning up the full proxy stack.
+fn nested_connect_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .body(full_body("CONNECT inside MITM'd stream is not supported"))
+        .expect("valid response")
 }
 
 /// Rewrite the `Host` request header to the effective upstream host.
@@ -334,9 +347,13 @@ async fn do_mitm(
     // Wrap sender in Arc<Mutex<>> so it can be shared across service_fn calls.
     let sender = Arc::new(Mutex::new(sender));
 
-    // Serve the decrypted client stream, forwarding each request upstream.
-    server_http1::Builder::new()
-        .preserve_header_case(true)
+    // Serve the decrypted client stream. `auto::Builder` picks HTTP/2 or
+    // HTTP/1.1 based on the ALPN protocol negotiated during the TLS
+    // handshake (see `CertificateAuthority::build_server_config`). Each
+    // concurrent HTTP/2 stream is driven as its own tokio task by hyper.
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http1().preserve_header_case(true);
+    builder
         .serve_connection(
             TokioIo::new(client_tls),
             service_fn(move |req: Request<Incoming>| {
@@ -346,173 +363,213 @@ async fn do_mitm(
                 let scanner = Arc::clone(&scanner);
                 let upstream_host = upstream_host.clone();
                 let subdomain_mode = subdomain_mode.clone();
-                async move {
-                    let (mut req_parts, body) = req.into_parts();
-
-                    // Extract activation modes from the header before it is
-                    // stripped by `strip_activation_header` — leaking the
-                    // header upstream would expose the browser extension.
-                    let header_modes = routing::parse_header_modes(&req_parts.headers);
-                    routing::strip_activation_header(&mut req_parts.headers);
-                    let modes = routing::merge_modes(subdomain_mode.as_deref(), &header_modes);
-
-                    headers::strip_hop_by_hop(&mut req_parts.headers);
-                    headers::strip_accept_encoding(&mut req_parts.headers);
-                    rewrite_host_header(&mut req_parts.headers, &upstream_host);
-                    let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
-
-                    // Network blocking: check before forwarding to upstream.
-                    // The URL uses the effective upstream host so Starlark
-                    // rules and ad-block lists see the real target.
-                    let req_url = format!("https://{upstream_host}{}", req_parts.uri);
-                    if blocker.is_blocked(&req_url, &upstream_host).await {
-                        tracing::debug!(url = %req_url, "request blocked by ad filter");
-                        return Ok(Response::builder()
-                            .status(StatusCode::NO_CONTENT)
-                            .body(empty_body())
-                            .expect("valid response"));
-                    }
-
-                    let upstream_req =
-                        Request::from_parts(req_parts.clone(), full_body(body_bytes));
-
-                    let resp = {
-                        let mut s = sender.lock().await;
-                        s.send_request(upstream_req)
-                            .await
-                            .map_err(ProxyError::Http)?
-                    };
-
-                    let (mut resp_parts, resp_body) = resp.into_parts();
-                    headers::strip_hop_by_hop(&mut resp_parts.headers);
-                    let resp_bytes = resp_body
-                        .collect()
-                        .await
-                        .map_err(ProxyError::Http)?
-                        .to_bytes();
-
-                    let content_type = resp_parts
-                        .headers
-                        .get(hyper::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    let is_html = content_type.contains("text/html");
-                    let is_text = is_html || content_type.contains("text/plain");
-                    let raw_pass_through = routing::is_raw(&modes);
-                    let trigger_ops = routing::modes_to_ops(&modes);
-
-                    // Scan text payloads in async context and collect matches for scripting.
-                    // Skipped in raw pass-through mode.
-                    let scan_matches = if is_text && !raw_pass_through {
-                        let m = scanner.scan(&resp_bytes).await;
-                        if !m.is_empty() {
-                            tracing::warn!(
-                                url = %req_url,
-                                categories = ?m.iter()
-                                    .map(|s| format!("{}:{}", s.category, s.count))
-                                    .collect::<Vec<_>>(),
-                                "content scan flagged"
-                            );
-                        }
-                        m
-                    } else {
-                        Vec::new()
-                    };
-
-                    // Run scripting + cosmetic rules for all text responses;
-                    // check for BlockPage before applying HTML rewriting.
-                    // Raw pass-through skips this pipeline entirely.
-                    let maybe_bytes: Option<bytes::Bytes> = if is_text && !raw_pass_through {
-                        let content_length = resp_bytes.len();
-                        let ctx = RequestCtx {
-                            url: req_url.clone(),
-                            host: upstream_host.clone(),
-                            content_type: content_type.clone(),
-                            status_code: resp_parts.status.as_u16(),
-                            request_headers: header_pairs(&req_parts.headers),
-                            response_headers: header_pairs(&resp_parts.headers),
-                            scan_matches,
-                            content_length,
-                            body: resp_bytes.clone(),
-                        };
-                        let cosmetic_css = if is_html {
-                            blocker.cosmetic_css_for(&upstream_host).await
-                        } else {
-                            None
-                        };
-                        let engine = Arc::clone(&engine);
-                        let raw: bytes::Bytes = resp_bytes;
-                        let (maybe_bytes, webhook_targets) =
-                            tokio::task::spawn_blocking(move || {
-                                let mut ops: Vec<crate::rewriter::RewriteOp> = Vec::new();
-                                if let Some(css) = cosmetic_css {
-                                    ops.push(crate::rewriter::RewriteOp::InjectStyle(css));
-                                }
-                                ops.extend(engine.run_rules(&ctx));
-                                ops.extend(trigger_ops);
-                                if ops
-                                    .iter()
-                                    .any(|o| matches!(o, crate::rewriter::RewriteOp::BlockPage))
-                                {
-                                    return (None, Vec::new());
-                                }
-                                let webhooks: Vec<(String, String)> = ops
-                                    .iter()
-                                    .filter_map(|op| {
-                                        if let crate::rewriter::RewriteOp::Webhook { url, body } =
-                                            op
-                                        {
-                                            Some((url.clone(), body.clone()))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                if !is_html || ops.is_empty() {
-                                    (Some(raw), webhooks)
-                                } else {
-                                    (
-                                        Some(
-                                            crate::rewriter::apply(&ops, &raw)
-                                                .map(bytes::Bytes::from)
-                                                .unwrap_or(raw),
-                                        ),
-                                        webhooks,
-                                    )
-                                }
-                            })
-                            .await
-                            .map_err(|e| ProxyError::Scripting(e.to_string()))?;
-                        for (url, body) in webhook_targets {
-                            tokio::spawn(crate::rewriter::fire_webhook(url, body));
-                        }
-                        maybe_bytes
-                    } else {
-                        Some(resp_bytes)
-                    };
-
-                    let final_bytes = match maybe_bytes {
-                        None => {
-                            tracing::info!(url = %req_url, "page blocked by content filter");
-                            return Ok(Response::builder()
-                                .status(StatusCode::FORBIDDEN)
-                                .body(full_body("Blocked by content filter"))
-                                .expect("valid response"));
-                        }
-                        Some(b) => b,
-                    };
-
-                    resp_parts.headers.insert(
-                        hyper::header::CONTENT_LENGTH,
-                        hyper::header::HeaderValue::from(final_bytes.len()),
-                    );
-                    Ok::<_, ProxyError>(Response::from_parts(resp_parts, full_body(final_bytes)))
-                }
+                handle_mitm_request(
+                    req,
+                    sender,
+                    engine,
+                    blocker,
+                    scanner,
+                    upstream_host,
+                    subdomain_mode,
+                )
             }),
         )
         .await
-        .map_err(ProxyError::Http)
+        .map_err(|e| ProxyError::ServerConnection(e.to_string()))
+}
+
+/// Shared alias for the upstream HTTP/1.1 sender used from the MITM handler.
+///
+/// Wrapped in `Arc<Mutex<…>>` because a single HTTP/2 client connection may
+/// dispatch several concurrent streams that must all use the same upstream
+/// pipe.
+type UpstreamSender = Arc<Mutex<hyper::client::conn::http1::SendRequest<BoxBody>>>;
+
+/// Handle a single request received on the MITM'd browser↔proxy connection.
+///
+/// This function is protocol-agnostic and is invoked identically by hyper's
+/// HTTP/1.1 driver and its HTTP/2 driver (dispatched via
+/// [`hyper_util::server::conn::auto`]).  Each h2 stream runs this function
+/// on its own tokio task, so `lol-html` rewriting runs per-stream in
+/// parallel.
+#[allow(clippy::too_many_arguments)]
+async fn handle_mitm_request(
+    req: Request<Incoming>,
+    sender: UpstreamSender,
+    engine: Arc<ScriptEngine>,
+    blocker: Arc<AdBlockEngine>,
+    scanner: Arc<TextScanner>,
+    upstream_host: String,
+    subdomain_mode: Option<String>,
+) -> Result<Response<BoxBody>, ProxyError> {
+    // Nested MITM (CONNECT-inside-h2, extended CONNECT for WebSockets over
+    // h2, MASQUE, …) is not supported — return 501 to keep the surface
+    // small.  Ordinary browsers never send CONNECT inside a MITM'd stream.
+    if req.method() == Method::CONNECT {
+        tracing::warn!(
+            authority = ?req.uri().authority().map(|a| a.as_str()),
+            "CONNECT inside MITM'd stream is not supported"
+        );
+        return Ok(nested_connect_response());
+    }
+
+    let (mut req_parts, body) = req.into_parts();
+
+    // Extract activation modes from the header before it is stripped by
+    // `strip_activation_header` — leaking the header upstream would expose
+    // the browser extension.
+    let header_modes = routing::parse_header_modes(&req_parts.headers);
+    routing::strip_activation_header(&mut req_parts.headers);
+    let modes = routing::merge_modes(subdomain_mode.as_deref(), &header_modes);
+
+    headers::strip_hop_by_hop(&mut req_parts.headers);
+    headers::strip_accept_encoding(&mut req_parts.headers);
+    rewrite_host_header(&mut req_parts.headers, &upstream_host);
+    let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
+
+    // Network blocking: check before forwarding to upstream. The URL uses
+    // the effective upstream host so Starlark rules and ad-block lists see
+    // the real target.
+    let req_url = format!("https://{upstream_host}{}", req_parts.uri);
+    if blocker.is_blocked(&req_url, &upstream_host).await {
+        tracing::debug!(url = %req_url, "request blocked by ad filter");
+        return Ok(Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(empty_body())
+            .expect("valid response"));
+    }
+
+    let upstream_req = Request::from_parts(req_parts.clone(), full_body(body_bytes));
+
+    let resp = {
+        let mut s = sender.lock().await;
+        s.send_request(upstream_req)
+            .await
+            .map_err(ProxyError::Http)?
+    };
+
+    let (mut resp_parts, resp_body) = resp.into_parts();
+    headers::strip_hop_by_hop(&mut resp_parts.headers);
+    let resp_bytes = resp_body
+        .collect()
+        .await
+        .map_err(ProxyError::Http)?
+        .to_bytes();
+
+    let content_type = resp_parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let is_html = content_type.contains("text/html");
+    let is_text = is_html || content_type.contains("text/plain");
+    let raw_pass_through = routing::is_raw(&modes);
+    let trigger_ops = routing::modes_to_ops(&modes);
+
+    // Scan text payloads in async context and collect matches for scripting.
+    // Skipped in raw pass-through mode.
+    let scan_matches = if is_text && !raw_pass_through {
+        let m = scanner.scan(&resp_bytes).await;
+        if !m.is_empty() {
+            tracing::warn!(
+                url = %req_url,
+                categories = ?m.iter()
+                    .map(|s| format!("{}:{}", s.category, s.count))
+                    .collect::<Vec<_>>(),
+                "content scan flagged"
+            );
+        }
+        m
+    } else {
+        Vec::new()
+    };
+
+    // Run scripting + cosmetic rules for all text responses; check for
+    // BlockPage before applying HTML rewriting. Raw pass-through skips this
+    // pipeline entirely.
+    let maybe_bytes: Option<bytes::Bytes> = if is_text && !raw_pass_through {
+        let content_length = resp_bytes.len();
+        let ctx = RequestCtx {
+            url: req_url.clone(),
+            host: upstream_host.clone(),
+            content_type: content_type.clone(),
+            status_code: resp_parts.status.as_u16(),
+            request_headers: header_pairs(&req_parts.headers),
+            response_headers: header_pairs(&resp_parts.headers),
+            scan_matches,
+            content_length,
+            body: resp_bytes.clone(),
+        };
+        let cosmetic_css = if is_html {
+            blocker.cosmetic_css_for(&upstream_host).await
+        } else {
+            None
+        };
+        let engine = Arc::clone(&engine);
+        let raw: bytes::Bytes = resp_bytes;
+        let (maybe_bytes, webhook_targets) = tokio::task::spawn_blocking(move || {
+            let mut ops: Vec<crate::rewriter::RewriteOp> = Vec::new();
+            if let Some(css) = cosmetic_css {
+                ops.push(crate::rewriter::RewriteOp::InjectStyle(css));
+            }
+            ops.extend(engine.run_rules(&ctx));
+            ops.extend(trigger_ops);
+            if ops
+                .iter()
+                .any(|o| matches!(o, crate::rewriter::RewriteOp::BlockPage))
+            {
+                return (None, Vec::new());
+            }
+            let webhooks: Vec<(String, String)> = ops
+                .iter()
+                .filter_map(|op| {
+                    if let crate::rewriter::RewriteOp::Webhook { url, body } = op {
+                        Some((url.clone(), body.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !is_html || ops.is_empty() {
+                (Some(raw), webhooks)
+            } else {
+                (
+                    Some(
+                        crate::rewriter::apply(&ops, &raw)
+                            .map(bytes::Bytes::from)
+                            .unwrap_or(raw),
+                    ),
+                    webhooks,
+                )
+            }
+        })
+        .await
+        .map_err(|e| ProxyError::Scripting(e.to_string()))?;
+        for (url, body) in webhook_targets {
+            tokio::spawn(crate::rewriter::fire_webhook(url, body));
+        }
+        maybe_bytes
+    } else {
+        Some(resp_bytes)
+    };
+
+    let final_bytes = match maybe_bytes {
+        None => {
+            tracing::info!(url = %req_url, "page blocked by content filter");
+            return Ok(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(full_body("Blocked by content filter"))
+                .expect("valid response"));
+        }
+        Some(b) => b,
+    };
+
+    resp_parts.headers.insert(
+        hyper::header::CONTENT_LENGTH,
+        hyper::header::HeaderValue::from(final_bytes.len()),
+    );
+    Ok(Response::from_parts(resp_parts, full_body(final_bytes)))
 }
 
 /// Forward a plain HTTP request to its destination.
@@ -749,6 +806,23 @@ mod tests {
             .body(())
             .expect("request");
         assert!(req.uri().authority().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_nested_connect_response_is_501_with_body() {
+        let resp = nested_connect_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        assert_eq!(
+            body,
+            Bytes::from_static(b"CONNECT inside MITM'd stream is not supported"),
+            "501 body must state the reason for the browser extension / user"
+        );
     }
 
     #[test]
