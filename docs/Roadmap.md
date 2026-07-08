@@ -167,10 +167,20 @@
 
 **Objective:** Finalise routing options, user experience, and performance targets.
 
-### Step 6.1 — Proxy Routing & Activation Triggers
+### Step 6.1 — Proxy Routing & Activation Triggers ✅
 
 - Auto-detect target sites via URL patterns or subdomains (e.g. `reader.https.example.com`).
 - Optional lightweight browser extension that injects activation headers (`X-Proxy-Control: reader`).
+- Subdomain triggers follow the fixed `<mode>.<proto>.<host…>` form; `<proto>`
+  must be `http` or `https`. The proxy rewrites the effective upstream target,
+  keeps serving a leaf certificate for the trigger authority, and queues the
+  mode's `RewriteOp` alongside those from Starlark rules.
+- `X-Proxy-Control` accepts a comma-separated list of modes; subdomain and
+  header modes are merged additively and de-duplicated in first-seen order.
+  The header is stripped before forwarding upstream.
+- Modes shipped: `reader` → `RewriteOp::ReaderMode`, `block` →
+  `RewriteOp::BlockPage`, and `raw` (pass-through — skip Starlark rules,
+  cosmetic filtering, scanning, and HTML rewriting).
 
 ### Step 6.2 — Performance Benchmarking
 

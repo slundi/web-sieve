@@ -3,6 +3,7 @@
 pub mod ca;
 pub mod fingerprint;
 pub mod headers;
+pub mod routing;
 pub mod tls;
 
 use std::net::SocketAddr;
@@ -41,6 +42,18 @@ fn empty_body() -> BoxBody {
 /// Convert a byte slice to a [`BoxBody`].
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
     Full::new(data.into()).map_err(|e| match e {}).boxed()
+}
+
+/// Rewrite the `Host` request header to the effective upstream host.
+///
+/// Called after a subdomain activation trigger redirects the upstream target:
+/// the browser sent `Host: <mode>.<proto>.<real_host>` but the request is
+/// actually being forwarded to `<real_host>`, so origin servers need the
+/// rewritten value to route correctly.
+fn rewrite_host_header(headers: &mut hyper::HeaderMap, upstream_host: &str) {
+    if let Ok(value) = hyper::header::HeaderValue::from_str(upstream_host) {
+        headers.insert(hyper::header::HOST, value);
+    }
 }
 
 /// Collect a header map into `(lowercased-name, value)` pairs, skipping any value
@@ -141,6 +154,23 @@ async fn proxy_request(
     }
 }
 
+/// Routing target for a MITM'd connection.
+///
+/// A subdomain activation trigger (`<mode>.https.<host>`) rewrites the
+/// effective upstream target while the browser continues to see the original
+/// authority on the leaf certificate.
+struct RoutingTarget {
+    /// Authority the browser CONNECTed to; used for the leaf certificate.
+    client_authority: String,
+    /// Effective upstream host (may differ from `client_authority` when a
+    /// subdomain trigger applied).
+    upstream_host: String,
+    /// Effective upstream port.
+    upstream_port: u16,
+    /// Subdomain-derived activation mode, if any.
+    subdomain_mode: Option<String>,
+}
+
 /// Handle a CONNECT tunnel request by performing MITM TLS interception.
 ///
 /// Returns `200 Connection Established` immediately, then upgrades the
@@ -159,8 +189,42 @@ async fn handle_connect(
         .ok_or_else(|| ProxyError::InvalidAuthority("missing authority".to_string()))?
         .clone();
 
-    let host = authority.host().to_string();
-    let port = authority.port_u16().unwrap_or(443);
+    let client_authority = authority.host().to_string();
+    let connect_port = authority.port_u16().unwrap_or(443);
+
+    // A CONNECT tunnel to `<mode>.<proto>.<real_host>` rewrites the effective
+    // upstream target so the browser sees the trigger subdomain (with its own
+    // leaf cert) while the proxy actually speaks to the real host. `http`
+    // triggers over a CONNECT tunnel are not supported and fall back to the
+    // literal CONNECT authority.
+    let trigger = routing::parse_host_trigger(&client_authority);
+    let target = match trigger {
+        Some(t) if t.upstream_https => RoutingTarget {
+            client_authority: client_authority.clone(),
+            upstream_host: t.target_host,
+            upstream_port: t.target_port,
+            subdomain_mode: Some(t.mode),
+        },
+        Some(t) => {
+            tracing::warn!(
+                client_authority = %client_authority,
+                mode = %t.mode,
+                "subdomain trigger with 'http' proto ignored inside CONNECT tunnel"
+            );
+            RoutingTarget {
+                client_authority: client_authority.clone(),
+                upstream_host: client_authority.clone(),
+                upstream_port: connect_port,
+                subdomain_mode: None,
+            }
+        }
+        None => RoutingTarget {
+            client_authority: client_authority.clone(),
+            upstream_host: client_authority.clone(),
+            upstream_port: connect_port,
+            subdomain_mode: None,
+        },
+    };
 
     // Select the browser TLS fingerprint profile from the User-Agent header.
     let ua = req
@@ -172,7 +236,15 @@ async fn handle_connect(
     let browser = fingerprint::Browser::from_user_agent(&ua);
     if tracing::enabled!(tracing::Level::DEBUG) {
         let (ja3_string, ja3_hash) = fingerprint::ja3_for_browser(browser);
-        tracing::debug!(%host, ?browser, ja3 = %ja3_hash, ja3_raw = %ja3_string, "CONNECT: selected fingerprint profile");
+        tracing::debug!(
+            client_authority = %target.client_authority,
+            upstream_host = %target.upstream_host,
+            subdomain_mode = ?target.subdomain_mode,
+            ?browser,
+            ja3 = %ja3_hash,
+            ja3_raw = %ja3_string,
+            "CONNECT: selected fingerprint profile"
+        );
     }
     let profile_config = profiles.config_for(browser);
 
@@ -183,8 +255,7 @@ async fn handle_connect(
             Ok(upgraded) => {
                 if let Err(err) = do_mitm(
                     upgraded,
-                    host,
-                    port,
+                    target,
                     ca,
                     profile_config,
                     engine,
@@ -212,29 +283,36 @@ async fn handle_connect(
 /// then connects to the upstream server using the browser-matched TLS profile
 /// and forwards each HTTP request.  Network-blocked requests are answered with
 /// `204 No Content` without touching the upstream.
-#[allow(clippy::too_many_arguments)]
 async fn do_mitm(
     upgraded: hyper::upgrade::Upgraded,
-    host: String,
-    port: u16,
+    target: RoutingTarget,
     ca: Arc<CertificateAuthority>,
     client_config: Arc<ClientConfig>,
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
     scanner: Arc<TextScanner>,
 ) -> Result<(), ProxyError> {
-    // Accept the client's TLS handshake using a per-domain leaf cert.
-    let server_cfg = ca.server_config(&host)?;
+    let RoutingTarget {
+        client_authority,
+        upstream_host,
+        upstream_port,
+        subdomain_mode,
+    } = target;
+
+    // Accept the client's TLS handshake using a per-domain leaf cert that
+    // matches the authority the browser CONNECTed to (may be a trigger
+    // subdomain like `reader.https.example.com`).
+    let server_cfg = ca.server_config(&client_authority)?;
     let acceptor = TlsAcceptor::from(server_cfg);
     let client_tls = acceptor
         .accept(TokioIo::new(upgraded))
         .await
         .map_err(ProxyError::Io)?;
 
-    // Open an upstream TCP + TLS connection.
-    let tcp = TcpStream::connect((host.as_str(), port)).await?;
-    let server_name = ServerName::try_from(host.clone())
-        .map_err(|_| ProxyError::InvalidDnsName(host.clone()))?
+    // Open an upstream TCP + TLS connection to the effective target.
+    let tcp = TcpStream::connect((upstream_host.as_str(), upstream_port)).await?;
+    let server_name = ServerName::try_from(upstream_host.clone())
+        .map_err(|_| ProxyError::InvalidDnsName(upstream_host.clone()))?
         .to_owned();
     let connector = TlsConnector::from(client_config);
     let upstream_tls = connector
@@ -266,16 +344,28 @@ async fn do_mitm(
                 let engine = Arc::clone(&engine);
                 let blocker = Arc::clone(&blocker);
                 let scanner = Arc::clone(&scanner);
-                let host = host.clone();
+                let upstream_host = upstream_host.clone();
+                let subdomain_mode = subdomain_mode.clone();
                 async move {
                     let (mut req_parts, body) = req.into_parts();
+
+                    // Extract activation modes from the header before it is
+                    // stripped by `strip_activation_header` — leaking the
+                    // header upstream would expose the browser extension.
+                    let header_modes = routing::parse_header_modes(&req_parts.headers);
+                    routing::strip_activation_header(&mut req_parts.headers);
+                    let modes = routing::merge_modes(subdomain_mode.as_deref(), &header_modes);
+
                     headers::strip_hop_by_hop(&mut req_parts.headers);
                     headers::strip_accept_encoding(&mut req_parts.headers);
+                    rewrite_host_header(&mut req_parts.headers, &upstream_host);
                     let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
 
                     // Network blocking: check before forwarding to upstream.
-                    let req_url = format!("https://{host}{}", req_parts.uri);
-                    if blocker.is_blocked(&req_url, &host).await {
+                    // The URL uses the effective upstream host so Starlark
+                    // rules and ad-block lists see the real target.
+                    let req_url = format!("https://{upstream_host}{}", req_parts.uri);
+                    if blocker.is_blocked(&req_url, &upstream_host).await {
                         tracing::debug!(url = %req_url, "request blocked by ad filter");
                         return Ok(Response::builder()
                             .status(StatusCode::NO_CONTENT)
@@ -309,9 +399,12 @@ async fn do_mitm(
                         .to_string();
                     let is_html = content_type.contains("text/html");
                     let is_text = is_html || content_type.contains("text/plain");
+                    let raw_pass_through = routing::is_raw(&modes);
+                    let trigger_ops = routing::modes_to_ops(&modes);
 
                     // Scan text payloads in async context and collect matches for scripting.
-                    let scan_matches = if is_text {
+                    // Skipped in raw pass-through mode.
+                    let scan_matches = if is_text && !raw_pass_through {
                         let m = scanner.scan(&resp_bytes).await;
                         if !m.is_empty() {
                             tracing::warn!(
@@ -329,11 +422,12 @@ async fn do_mitm(
 
                     // Run scripting + cosmetic rules for all text responses;
                     // check for BlockPage before applying HTML rewriting.
-                    let maybe_bytes: Option<bytes::Bytes> = if is_text {
+                    // Raw pass-through skips this pipeline entirely.
+                    let maybe_bytes: Option<bytes::Bytes> = if is_text && !raw_pass_through {
                         let content_length = resp_bytes.len();
                         let ctx = RequestCtx {
                             url: req_url.clone(),
-                            host: host.clone(),
+                            host: upstream_host.clone(),
                             content_type: content_type.clone(),
                             status_code: resp_parts.status.as_u16(),
                             request_headers: header_pairs(&req_parts.headers),
@@ -343,7 +437,7 @@ async fn do_mitm(
                             body: resp_bytes.clone(),
                         };
                         let cosmetic_css = if is_html {
-                            blocker.cosmetic_css_for(&host).await
+                            blocker.cosmetic_css_for(&upstream_host).await
                         } else {
                             None
                         };
@@ -356,6 +450,7 @@ async fn do_mitm(
                                     ops.push(crate::rewriter::RewriteOp::InjectStyle(css));
                                 }
                                 ops.extend(engine.run_rules(&ctx));
+                                ops.extend(trigger_ops);
                                 if ops
                                     .iter()
                                     .any(|o| matches!(o, crate::rewriter::RewriteOp::BlockPage))
@@ -433,15 +528,36 @@ async fn forward_http(
     scanner: Arc<TextScanner>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     let uri = req.uri().clone();
-    let host = uri
+    let request_host = uri
         .host()
         .ok_or_else(|| ProxyError::InvalidAuthority("missing host in HTTP request".to_string()))?
         .to_string();
-    let port = uri.port_u16().unwrap_or(80);
+    let request_port = uri.port_u16().unwrap_or(80);
 
-    // Network blocking: check before connecting to upstream.
-    if blocker.is_blocked(&uri.to_string(), &host).await {
-        tracing::debug!(host = %host, "request blocked by ad filter");
+    // Detect subdomain activation triggers on the request URI. Unlike CONNECT,
+    // plain HTTP handles both `http` and `https` upstream by TCP connection
+    // choice — but this proxy code path is only reached for unencrypted
+    // browser-to-proxy traffic, so the trigger's `<proto>` label controls the
+    // upstream port only.
+    let host_trigger = routing::parse_host_trigger(&request_host);
+    let (upstream_host, upstream_port, subdomain_mode) = match &host_trigger {
+        Some(t) => (t.target_host.clone(), t.target_port, Some(t.mode.clone())),
+        None => (request_host.clone(), request_port, None),
+    };
+
+    // Network blocking: check before connecting to upstream. Use the effective
+    // upstream host so lists and rules see the real target.
+    let effective_url = if host_trigger.is_some() {
+        let path_and_query = uri
+            .path_and_query()
+            .map(|p| p.as_str().to_owned())
+            .unwrap_or_default();
+        format!("http://{upstream_host}{path_and_query}")
+    } else {
+        uri.to_string()
+    };
+    if blocker.is_blocked(&effective_url, &upstream_host).await {
+        tracing::debug!(host = %upstream_host, "request blocked by ad filter");
         return Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(empty_body())
@@ -450,16 +566,24 @@ async fn forward_http(
 
     let (mut parts, body) = req.into_parts();
 
+    // Extract activation modes before the header is stripped.
+    let header_modes = routing::parse_header_modes(&parts.headers);
+    routing::strip_activation_header(&mut parts.headers);
+    let modes = routing::merge_modes(subdomain_mode.as_deref(), &header_modes);
+    let raw_pass_through = routing::is_raw(&modes);
+    let trigger_ops = routing::modes_to_ops(&modes);
+
     // Strip all hop-by-hop headers (including proxy-connection).
     headers::strip_hop_by_hop(&mut parts.headers);
     headers::strip_accept_encoding(&mut parts.headers);
+    rewrite_host_header(&mut parts.headers, &upstream_host);
 
     // Capture forwarded request headers before `parts` is moved into the upstream request.
     let request_headers = header_pairs(&parts.headers);
 
     let body_bytes = body.collect().await.map_err(ProxyError::Http)?.to_bytes();
 
-    let tcp = TcpStream::connect((host.as_str(), port)).await?;
+    let tcp = TcpStream::connect((upstream_host.as_str(), upstream_port)).await?;
     let (mut sender, conn) = client_http1::handshake(TokioIo::new(tcp))
         .await
         .map_err(ProxyError::Http)?;
@@ -494,11 +618,12 @@ async fn forward_http(
     let is_text = is_html || content_type.contains("text/plain");
 
     // Scan text payloads in async context and collect matches for scripting.
-    let scan_matches = if is_text {
+    // Skipped in raw pass-through mode.
+    let scan_matches = if is_text && !raw_pass_through {
         let m = scanner.scan(&resp_bytes).await;
         if !m.is_empty() {
             tracing::warn!(
-                url = %uri,
+                url = %effective_url,
                 categories = ?m.iter()
                     .map(|s| format!("{}:{}", s.category, s.count))
                     .collect::<Vec<_>>(),
@@ -512,11 +637,12 @@ async fn forward_http(
 
     // Run scripting + cosmetic rules for all text responses;
     // check for BlockPage before applying HTML rewriting.
-    let maybe_bytes: Option<bytes::Bytes> = if is_text {
+    // Raw pass-through skips this pipeline entirely.
+    let maybe_bytes: Option<bytes::Bytes> = if is_text && !raw_pass_through {
         let content_length = resp_bytes.len();
         let ctx = RequestCtx {
-            url: uri.to_string(),
-            host: host.clone(),
+            url: effective_url.clone(),
+            host: upstream_host.clone(),
             content_type: content_type.clone(),
             status_code: resp_parts.status.as_u16(),
             request_headers,
@@ -526,7 +652,7 @@ async fn forward_http(
             body: resp_bytes.clone(),
         };
         let cosmetic_css = if is_html {
-            blocker.cosmetic_css_for(&host).await
+            blocker.cosmetic_css_for(&upstream_host).await
         } else {
             None
         };
@@ -537,6 +663,7 @@ async fn forward_http(
                 ops.push(crate::rewriter::RewriteOp::InjectStyle(css));
             }
             ops.extend(engine.run_rules(&ctx));
+            ops.extend(trigger_ops);
             if ops
                 .iter()
                 .any(|o| matches!(o, crate::rewriter::RewriteOp::BlockPage))
@@ -583,7 +710,7 @@ async fn forward_http(
 
     let final_bytes = match maybe_bytes {
         None => {
-            tracing::info!(url = %uri, "page blocked by content filter");
+            tracing::info!(url = %effective_url, "page blocked by content filter");
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(full_body("Blocked by content filter"))
