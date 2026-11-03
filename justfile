@@ -21,11 +21,14 @@ watch:
 test:
     cargo nextest run
 
-# Run a full health check (Vulnerabilities, Unused Deps, Licenses)
+# Run a full health check (Vulnerabilities, Unmaintained crates, Licenses, Unused Deps)
 health-check:
-    cargo audit
-    cargo machete
     cargo deny check
+    cargo machete
+
+# Report direct dependencies with a newer release available (informational, never fails)
+outdated:
+    cargo outdated --root-deps-only --exit-code 0
 
 # Run clippy with strict warnings
 lint:

@@ -11,18 +11,16 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
-  outputs =
-    {
-      self,
-      nixpkgs,
-      flake-utils,
-      rust-overlay,
-    }:
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+    rust-overlay,
+  }:
     flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs { inherit system overlays; };
+      system: let
+        overlays = [(import rust-overlay)];
+        pkgs = import nixpkgs {inherit system overlays;};
         marketplaceExtensions = map pkgs.vscode-utils.buildVscodeMarketplaceExtension [
           {
             mktplcRef = {
@@ -49,8 +47,7 @@
             sha256 = "sha256-Eyye+kFdDI2SWtUdyR36QvZ9YVkvRma5aPqDxMfSZKw=";
           }
         ];
-        extensions =
-          with pkgs.vscode-extensions;
+        extensions = with pkgs.vscode-extensions;
           [
             rust-lang.rust-analyzer
             tamasfe.even-better-toml
@@ -66,8 +63,7 @@
 
         # Read project metadata from Cargo.toml for reuse below
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-      in
-      {
+      in {
         # `nix build` and `nix run` — builds the release binary
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = cargoToml.package.name;
@@ -86,6 +82,7 @@
             cargo-machete
             cargo-audit
             cargo-deny
+            cargo-outdated # Reports dependencies with newer releases available
             cargo-llvm-cov # Coverage instrumentation via LLVM
             jaq # JSON processor (used by coverage-check)
             prek # pre-commit
