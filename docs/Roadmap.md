@@ -264,8 +264,182 @@
 > `web-sieve`. Kept as written and made configurable; rename the default in
 > `assets::DEFAULT_ASSET_HOST` if the discrepancy was unintended.
 
+## Phase 7 — REST Control & Extraction API
+
+**Objective:** Expose the proxy's engines over an optional local HTTP API, so non-browser clients
+(scripts, dashboards, LLM agents, other hosts) can use them, and so rule authoring stops being log
+archaeology.
+
+Entirely optional and **disabled by default**: `--api=off|readonly|rw` (plus `--api-listen`,
+default `127.0.0.1:8737`). Built on `axum`, reusing the existing `tokio` runtime.
+
+This phase introduces the project's **first configuration file**. Config is CLI flags only today,
+and tokens cannot be flags — `--api-token=…` is visible in `ps aux` to every user on the machine,
+and leaks into shell history and systemd unit files. The file lives in the XDG config directory and
+is read with `toml-span`: parsing happens once at load, and byte-offset spans point at the offending
+client entry on error.
+
+### Step 7.1 — Rule Authoring & Introspection
+
+Highest priority: this is the dev loop for every remaining Phase 4 schema. Hot-reload (3.3) tells
+you a rule _loaded_; nothing today tells you what it _did_.
+
+- `GET /v1/rules` — loaded scripts, their `URLS` globs, load errors, last reload timestamp.
+  Answers "why isn't my rule firing" in one call (usually: the glob).
+- `POST /v1/rules/validate` — parse and freeze a `.star` without installing it; return the declared
+  `URLS` and any error with its span.
+- `POST /v1/preview` `{url, rule?}` — run the rule set against a live URL; return before/after HTML,
+  a diff, and the queued `RewriteOp` list.
+- `POST /v1/templates/render` `{name, context}` — surface minijinja errors that 6.4 currently only
+  writes to the log while silently serving the upstream page.
+- `PUT /v1/rules/{name}`, `POST /v1/rules/{name}/{enable,disable}` — install or toggle a rule
+  without deleting the file. Write-mode only, and gated behind its own flag (see 7.6).
+- Secondary payoff: community rule repos can CI-test against a disposable instance — POST the
+  `.star` plus a fixture URL, assert the extracted JSON.
+
+### Step 7.2 — Content Extraction as a Service
+
+The differentiator is not "fetch a URL" — it is the Phase 2 stealth stack. A plain `reqwest` client
+gets a Cloudflare interstitial; this one does not.
+
+- `POST /v1/fetch` `{url, mode: raw|reader|markdown}` — cleaned body plus the ops that were applied.
+- `POST /v1/extract` `{url|html, rule}` — structured JSON from a rule's schema, which turns the
+  Phase 4.3–4.11 schemas (weather, product, torrent list, SERP, forge, wiki) into a data API.
+- `POST /v1/readability` `{html}` — title, byline, text, images, with no network access at all.
+- `mode: markdown` makes the MCP server trivial: three tools (`fetch_clean_page`,
+  `extract_structured`, `check_safety`) wrapping three endpoints.
+- Other consumers: RSS generation for sites without feeds, read-later ingestion (Shiori, Pocket),
+  archival, terminal readers.
+
+### Step 7.3 — Safety Scoring as a Service
+
+Decouples Phase 5 from the in-band proxy path, so clients that are not a browser can get a verdict.
+
+- `POST /v1/scan` — category scores, matched terms, density against the configured threshold,
+  final verdict.
+- `POST /v1/phishing/check` — heuristic verdict plus the triggering form fields and panic phrases.
+- Consumers: mail-client link checking, Home Assistant, another host on the LAN, SIEM enrichment
+  ("what was actually on that page").
+
+### Step 7.4 — Observability
+
+- `GET /v1/stats` — requests proxied, bytes saved, ads blocked, per-rule hit counts and time spent,
+  latency histogram. The histogram is how the <15 ms target in 6.2 gets held in production rather
+  than only in benchmarks.
+- `GET /metrics` — same counters in Prometheus format, for Grafana.
+- `GET /v1/flows?since=…` — recent requests: host, modes applied, rules hit, size delta.
+  mitmproxy's flow list without the UI; a `ratatouille` TUI or a waybar/polybar widget is the obvious
+  client.
+- `GET /v1/health` — systemd/container readiness; confirms the CA is loaded.
+
+### Step 7.5 — Runtime Overrides, Profiles & Configuration
+
+The extension (6.1) injects `X-Proxy-Control` per request but cannot hold state. The API can.
+
+- `POST /v1/overrides` `{host, mode: raw, ttl: 10m}` — "show me the real page for ten minutes",
+  from a hotkey script, with no config edit and no restart.
+- `POST /v1/overrides` `{host, allow, ttl: 30m}` — parental temporary unblock.
+- `POST /v1/unblock-requests` + `GET` + approve — the block page gets a "request access" button;
+  a parent approves from a phone. Turns a dead end into a workflow.
+- `PUT /v1/clients/{ip}/profile` — per-device policy when one instance serves a LAN (strict
+  scanning on a child's tablet, permissive on a laptop). Without it, LAN deployment is
+  one-size-fits-all.
+- `GET /v1/ca.crt` — certificate, fingerprint, per-OS install hints. Onboarding a phone becomes
+  "open this URL" instead of "scp a file".
+- `GET`/`PUT /v1/config` — CORS allowlist, scoring thresholds, blocklist URLs.
+- `POST /v1/filters/update` — refresh EasyList/uBlock lists without a restart.
+- Makes headless deployment viable (router, homelab box, container): there is no browser on that
+  host, so the API _is_ the UI, and a dashboard served from `webprism.local` becomes a pure client.
+
+### Step 7.6 — Clients, Scopes & Security Boundary
+
+Authorisation is two layers: `--api` is the operator's **ceiling**, per-client scopes are the
+**grant**. A client holding `rules:write` gets nothing in `readonly` mode.
+
+- `off` (default) — no listener bound, zero added attack surface.
+- `readonly` — GET only: stats, flows, rules, config dump, CA cert, health. Enough for dashboards,
+  TUIs and monitoring; cannot change policy.
+- `rw` — write endpoints reachable, subject to each client's scopes.
+
+Named clients in the config file, identified by what they _are_ (an integration, a device) rather
+than by who owns them — that keeps revocation granular, so the dashboard token can be rotated
+without breaking the agent:
+
+```toml
+[api]
+mode = "rw"
+listen = "127.0.0.1:8737"
+
+[[api.clients]]
+id = "grafana"
+token_sha256 = "9f86d081884c7d65…"
+scopes = ["stats:read", "flows:read"]
+
+[[api.clients]]
+id = "mcp-agent"
+token_sha256 = "…"
+scopes = ["fetch", "extract", "scan"]
+rate_limit = "60/min"
+
+[[api.clients]]
+id = "jessica"
+token_sha256 = "…"
+role = "parent"
+scopes = ["*"]
+```
+
+- Scopes: `stats:read`, `flows:read`, `rules:read`, `rules:write`, `config:read`, `config:write`,
+  `overrides:write`, `fetch`, `extract`, `scan`. They replace the `--api-allow-fetch` flag from the
+  first draft of this phase — the network-touching POSTs are gated per client rather than per
+  process.
+- `role` matters only where the principal is a _human_: the approve-unblock flow in 7.5 requires
+  `role = "parent"`. On a machine the child can read, pair it with a PIN on the approval itself —
+  file permissions alone are not the boundary there.
+- Per-client `rate_limit`, because `/v1/fetch` is an open-proxy primitive.
+- Every request logs `client=<id> scope=<granted>`; token material is never logged.
+
+**No loopback exemption.** Authentication is required even for `127.0.0.1`. Any page in the browser
+can issue `fetch('http://127.0.0.1:8737/v1/rules/evil', {method:'PUT', …})`; CORS prevents the page
+from _reading_ the response but not from _executing_ the request, so an unauthenticated loopback API
+is a CSRF target for every site visited — through this very proxy. Also validate the `Host` header
+against the configured listen address, which blocks DNS rebinding.
+
+Remaining boundary rules:
+
+- **Keep the API off `webprism.local`.** That host is reachable from any intercepted page's
+  JavaScript. Separate port, bound to loopback by default, CORS denied outright (not the asset
+  host's allowlist from 6.5), `Origin` checked.
+- `/v1/fetch` is an SSRF primitive: never forward the user's cookie jar by default (opt-in per
+  request), and deny loopback/link-local/RFC1918/cloud-metadata targets.
+- `PUT /v1/rules/{name}` is remote code upload. Starlark is sandboxed but can still fire webhooks,
+  so it needs an explicit `rules:write` scope — never `*` for an unattended integration.
+- Refuse to start if the config file is group- or world-readable, as `ssh` does; it will end up in a
+  dotfiles repository otherwise.
+- Support `token_file = "…"` indirection so the secret can come from a password manager or a
+  systemd credential rather than the config file.
+
+### Step 7.7 — Token Generation CLI
+
+Tokens are generated by the tool, never chosen by the user. That choice is what makes a fast hash
+the correct one.
+
+```sh
+$ web-sieve api token create mcp-agent --scopes fetch,extract
+wsv_mcp-agent_8Kj2nQ…        # shown once, then only its hash is stored
+```
+
+- 256 bits from the OS RNG, stored as `sha256` (`sha2`). **Not `argon2`:** a KDF's slowness only
+  buys security against low-entropy human-chosen secrets, and at 50–100 ms per request it would
+  dwarf the <15 ms latency target of 6.2 on any client that loops.
+- Verification keys a `HashMap<[u8; 32], Client>` by the SHA-256 of the presented token, so the
+  lookup never performs a secret-dependent byte comparison — constant-time by construction, with no
+  extra crate.
+- The `wsv_<id>_<secret>` form carries a non-secret client id, so logs and errors can name the
+  caller without ever touching secret material.
+- Companion subcommands: `token list` (id, scopes, created, last used), `token revoke <id>`,
+  `token rotate <id>`. Revocation takes effect on config reload — reuse the existing `notify`
+  watcher, but only for a file that passed the permission check above.
+
 ## Ideas
 
-- REST service:
-  - scoring (see phase 5)
-  - to get cleaned content, may be useful for scrapper, MCP, ...
+- REST service — promoted to Phase 7 above.
