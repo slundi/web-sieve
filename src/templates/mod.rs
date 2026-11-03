@@ -15,6 +15,8 @@ use std::sync::{Arc, RwLock};
 
 use minijinja::Environment;
 
+use crate::assets::AssetServer;
+
 /// Files whose name starts with `.` or ends with `~` are editor artefacts and
 /// are never registered as templates.
 fn is_template_file(path: &Path) -> bool {
@@ -44,13 +46,56 @@ fn template_names(path: &Path) -> Vec<String> {
     names
 }
 
+/// Register the asset helpers available to every template.
+///
+/// * `inline_asset(path)` — splice a shared or per-script asset straight into
+///   the document, avoiding a second round-trip. The content is marked safe so
+///   CSS and JS are emitted verbatim instead of HTML-escaped; only inline files
+///   you control. A missing or non-UTF-8 asset yields an empty string and a
+///   warning rather than failing the render.
+/// * `asset_url(path)` — the `http://<asset-host>/assets/<path>` URL, for files
+///   too large to inline.
+///
+/// Both are registered on a fresh [`Environment`], so they survive every
+/// hot-reload rebuild.
+fn register_asset_helpers(env: &mut Environment<'static>, assets: Option<Arc<AssetServer>>) {
+    let Some(assets) = assets else {
+        return;
+    };
+
+    let for_inline = Arc::clone(&assets);
+    env.add_function("inline_asset", move |path: String| {
+        match for_inline.read_text(&path) {
+            Some(text) => minijinja::Value::from_safe_string(text),
+            None => {
+                tracing::warn!(asset = %path, "inline_asset(): asset not found");
+                minijinja::Value::from("")
+            }
+        }
+    });
+
+    let for_url = Arc::clone(&assets);
+    env.add_function("asset_url", move |path: String| {
+        format!(
+            "http://{}{}{}",
+            for_url.host(),
+            crate::assets::ASSET_PREFIX,
+            path.trim_start_matches('/')
+        )
+    });
+}
+
 /// Read every template file in `dir` and compile it into a fresh
 /// [`Environment`].
 ///
 /// A template that cannot be read or fails to parse is logged and skipped so a
 /// single broken file never takes the whole template set down.
-async fn build_environment(dir: &Path) -> std::io::Result<Environment<'static>> {
+async fn build_environment(
+    dir: &Path,
+    assets: Option<Arc<AssetServer>>,
+) -> std::io::Result<Environment<'static>> {
     let mut env = Environment::new();
+    register_asset_helpers(&mut env, assets);
 
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut read_dir = tokio::fs::read_dir(dir).await?;
@@ -124,12 +169,34 @@ impl TemplateEngine {
     /// Returns an error if the directory cannot be created or read, or if a
     /// filesystem watcher cannot be installed.
     pub async fn new(templates_dir: PathBuf) -> anyhow::Result<Arc<Self>> {
+        Self::build(templates_dir, None).await
+    }
+
+    /// Like [`new`](Self::new), but templates may also call `inline_asset()`
+    /// and `asset_url()` against `assets`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`new`](Self::new).
+    pub async fn with_assets(
+        templates_dir: PathBuf,
+        assets: Arc<AssetServer>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build(templates_dir, Some(assets)).await
+    }
+
+    async fn build(
+        templates_dir: PathBuf,
+        assets: Option<Arc<AssetServer>>,
+    ) -> anyhow::Result<Arc<Self>> {
         use notify::{RecursiveMode, Watcher, recommended_watcher};
         use tokio::sync::mpsc;
 
         tokio::fs::create_dir_all(&templates_dir).await?;
 
-        let env = Arc::new(RwLock::new(build_environment(&templates_dir).await?));
+        let env = Arc::new(RwLock::new(
+            build_environment(&templates_dir, assets.clone()).await?,
+        ));
 
         let (tx, mut rx) = mpsc::channel::<notify::Result<notify::Event>>(32);
         let mut watcher = recommended_watcher(move |res| {
@@ -142,7 +209,9 @@ impl TemplateEngine {
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
-                    Ok(ev) => handle_notify_event(ev, &dir_for_task, &env_for_task).await,
+                    Ok(ev) => {
+                        handle_notify_event(ev, &dir_for_task, &env_for_task, assets.clone()).await
+                    }
                     Err(e) => tracing::warn!("template watcher error: {e}"),
                 }
             }
@@ -191,7 +260,12 @@ impl TemplateEngine {
 /// A full rebuild (rather than a per-file patch) keeps removals and stem
 /// collisions consistent; template directories are small enough that the extra
 /// reads are irrelevant next to a page render.
-async fn handle_notify_event(event: notify::Event, dir: &Path, env: &RwLock<Environment<'static>>) {
+async fn handle_notify_event(
+    event: notify::Event,
+    dir: &Path,
+    env: &RwLock<Environment<'static>>,
+    assets: Option<Arc<AssetServer>>,
+) {
     use notify::EventKind;
 
     if !matches!(
@@ -204,7 +278,7 @@ async fn handle_notify_event(event: notify::Event, dir: &Path, env: &RwLock<Envi
         return;
     }
 
-    match build_environment(dir).await {
+    match build_environment(dir, assets).await {
         Ok(new_env) => {
             *env.write().unwrap_or_else(|e| e.into_inner()) = new_env;
             tracing::info!(dir = %dir.display(), "templates reloaded");
@@ -221,6 +295,180 @@ mod tests {
 
     fn write_template(dir: &Path, name: &str, body: &str) {
         std::fs::write(dir.join(name), body).expect("write template");
+    }
+
+    /// Build an [`AssetServer`] over `shared` with an empty per-script root.
+    fn assets_over(shared: &Path, scripts: &Path) -> Arc<AssetServer> {
+        Arc::new(AssetServer::new(
+            crate::assets::DEFAULT_ASSET_HOST.to_string(),
+            shared.to_path_buf(),
+            scripts.to_path_buf(),
+            Vec::new(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_inline_asset_splices_file_contents_verbatim() {
+        let data = tempfile::tempdir().expect("data");
+        let scripts = tempfile::tempdir().expect("scripts");
+        std::fs::create_dir_all(data.path().join("css")).expect("mkdir");
+        // Characters that HTML-escaping would mangle, proving the safe-string path.
+        std::fs::write(data.path().join("css/site.css"), "a > b { content: '\"' }")
+            .expect("write css");
+
+        let templates = data.path().join("templates");
+        std::fs::create_dir_all(&templates).expect("mkdir templates");
+        write_template(
+            &templates,
+            "page.html",
+            "<style>{{ inline_asset(\"css/site.css\") }}</style>",
+        );
+
+        let engine =
+            TemplateEngine::with_assets(templates, assets_over(data.path(), scripts.path()))
+                .await
+                .expect("engine");
+        let out = engine
+            .render("page", &serde_json::json!({}))
+            .expect("render");
+        assert_eq!(out, "<style>a > b { content: '\"' }</style>");
+    }
+
+    #[tokio::test]
+    async fn test_inline_asset_missing_file_renders_empty() {
+        let data = tempfile::tempdir().expect("data");
+        let scripts = tempfile::tempdir().expect("scripts");
+        let templates = data.path().join("templates");
+        std::fs::create_dir_all(&templates).expect("mkdir templates");
+        write_template(
+            &templates,
+            "page.html",
+            "[{{ inline_asset(\"css/x.css\") }}]",
+        );
+
+        let engine =
+            TemplateEngine::with_assets(templates, assets_over(data.path(), scripts.path()))
+                .await
+                .expect("engine");
+        assert_eq!(
+            engine
+                .render("page", &serde_json::json!({}))
+                .expect("render"),
+            "[]",
+            "a missing asset must not fail the render"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inline_asset_prefers_per_script_file() {
+        let data = tempfile::tempdir().expect("data");
+        let scripts = tempfile::tempdir().expect("scripts");
+        std::fs::create_dir_all(data.path().join("nyaa")).expect("mkdir shared");
+        std::fs::write(data.path().join("nyaa/s.css"), "SHARED").expect("write shared");
+        std::fs::create_dir_all(scripts.path().join("nyaa")).expect("mkdir script");
+        std::fs::write(scripts.path().join("nyaa/s.css"), "SCRIPT").expect("write script");
+
+        let templates = data.path().join("templates");
+        std::fs::create_dir_all(&templates).expect("mkdir templates");
+        write_template(
+            &templates,
+            "page.html",
+            "{{ inline_asset(\"nyaa/s.css\") }}",
+        );
+
+        let engine =
+            TemplateEngine::with_assets(templates, assets_over(data.path(), scripts.path()))
+                .await
+                .expect("engine");
+        assert_eq!(
+            engine
+                .render("page", &serde_json::json!({}))
+                .expect("render"),
+            "SCRIPT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asset_url_builds_local_endpoint_url() {
+        let data = tempfile::tempdir().expect("data");
+        let scripts = tempfile::tempdir().expect("scripts");
+        let templates = data.path().join("templates");
+        std::fs::create_dir_all(&templates).expect("mkdir templates");
+        write_template(
+            &templates,
+            "page.html",
+            "{{ asset_url(\"/fonts/a.woff2\") }}",
+        );
+
+        let engine =
+            TemplateEngine::with_assets(templates, assets_over(data.path(), scripts.path()))
+                .await
+                .expect("engine");
+        assert_eq!(
+            engine
+                .render("page", &serde_json::json!({}))
+                .expect("render"),
+            "http://webprism.local/assets/fonts/a.woff2",
+            "a leading slash in the argument must not double up"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asset_helpers_absent_without_an_asset_server() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_template(tmp.path(), "page.html", "{{ inline_asset(\"a.css\") }}");
+
+        let engine = TemplateEngine::new(tmp.path().to_path_buf())
+            .await
+            .expect("engine");
+        assert!(
+            engine.render("page", &serde_json::json!({})).is_err(),
+            "without an AssetServer the helper is not registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_asset_helpers_survive_hot_reload() {
+        let data = tempfile::tempdir().expect("data");
+        let scripts = tempfile::tempdir().expect("scripts");
+        std::fs::write(data.path().join("note.txt"), "HELLO").expect("write asset");
+
+        let templates_dir = data.path().join("templates");
+        std::fs::create_dir_all(&templates_dir).expect("mkdir templates");
+        write_template(&templates_dir, "page.html", "v1");
+
+        let assets = assets_over(data.path(), scripts.path());
+        let env = RwLock::new(
+            build_environment(&templates_dir, Some(Arc::clone(&assets)))
+                .await
+                .expect("build"),
+        );
+
+        // Rewrite the template to use the helper, then drive a reload.
+        write_template(
+            &templates_dir,
+            "page.html",
+            "{{ inline_asset(\"note.txt\") }}",
+        );
+        let event = notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            paths: vec![templates_dir.join("page.html")],
+            attrs: Default::default(),
+        };
+        handle_notify_event(event, &templates_dir, &env, Some(assets)).await;
+
+        let guard = env.read().expect("read");
+        let rendered = guard
+            .get_template("page")
+            .expect("template")
+            .render(minijinja::value::Serde(&serde_json::json!({})))
+            .expect("render");
+        assert_eq!(
+            rendered, "HELLO",
+            "asset helpers must be re-registered on every rebuild"
+        );
     }
 
     #[test]
@@ -381,7 +629,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_template(tmp.path(), "page.html", "v1");
 
-        let env = RwLock::new(build_environment(tmp.path()).await.expect("build"));
+        let env = RwLock::new(build_environment(tmp.path(), None).await.expect("build"));
         write_template(tmp.path(), "page.html", "v2");
 
         let event = notify::Event {
@@ -391,7 +639,7 @@ mod tests {
             paths: vec![tmp.path().join("page.html")],
             attrs: Default::default(),
         };
-        handle_notify_event(event, tmp.path(), &env).await;
+        handle_notify_event(event, tmp.path(), &env, None).await;
 
         let guard = env.read().expect("read");
         let rendered = guard
@@ -407,7 +655,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_template(tmp.path(), "page.html", "v1");
 
-        let env = RwLock::new(build_environment(tmp.path()).await.expect("build"));
+        let env = RwLock::new(build_environment(tmp.path(), None).await.expect("build"));
         std::fs::remove_file(tmp.path().join("page.html")).expect("remove");
 
         let event = notify::Event {
@@ -415,7 +663,7 @@ mod tests {
             paths: vec![tmp.path().join("page.html")],
             attrs: Default::default(),
         };
-        handle_notify_event(event, tmp.path(), &env).await;
+        handle_notify_event(event, tmp.path(), &env, None).await;
 
         let guard = env.read().expect("read");
         assert!(
@@ -429,7 +677,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_template(tmp.path(), "page.html", "v1");
 
-        let env = RwLock::new(build_environment(tmp.path()).await.expect("build"));
+        let env = RwLock::new(build_environment(tmp.path(), None).await.expect("build"));
         write_template(tmp.path(), "page.html", "v2");
 
         let event = notify::Event {
@@ -437,7 +685,7 @@ mod tests {
             paths: vec![tmp.path().join("page.html")],
             attrs: Default::default(),
         };
-        handle_notify_event(event, tmp.path(), &env).await;
+        handle_notify_event(event, tmp.path(), &env, None).await;
 
         let guard = env.read().expect("read");
         let rendered = guard

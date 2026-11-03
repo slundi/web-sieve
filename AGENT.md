@@ -134,6 +134,8 @@ src/
 │   └── mod.rs
 ├── templates/       # minijinja display templates and hot-reload
 │   └── mod.rs
+├── assets/          # static asset resolution for the local endpoint
+│   └── mod.rs
 └── filter/          # aho-corasick content safety engine
     └── mod.rs
 ```

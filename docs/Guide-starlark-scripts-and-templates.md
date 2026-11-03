@@ -12,6 +12,9 @@ You can override it with `--rules-dir`.
 
 - Files are loaded in **alphabetical order**; that order is preserved when multiple
   rules apply to the same response.
+- `.star` files directly in the rules directory are loaded, as are those one level
+  down in a per-script folder (`rules/<script>/<name>.star`) — see
+  [Static assets and the local endpoint](#static-assets-and-the-local-endpoint).
 - The engine **hot-reloads** on any create, modify, or remove event — no proxy
   restart needed.
 - A broken file emits a warning and is skipped; healthy rules keep running.
@@ -296,6 +299,75 @@ A minimal template:
 Templates can inherit from each other with Minijinja's `{% extends %}` and
 `{% block %}` tags. A shared `base.html` in the templates directory keeps
 common styles in one place.
+
+## Static assets and the local endpoint
+
+The proxy answers one hostname itself: **`webprism.local`**. No DNS record and
+no `/etc/hosts` entry are needed — the proxy matches on the `Host` and never
+contacts an upstream. Change it with `--asset-host`.
+
+Everything lives under `/assets/…` and comes from one of two roots:
+
+| Request                                | Resolved from                                            |
+| -------------------------------------- | -------------------------------------------------------- |
+| `webprism.local/assets/css/site.css`   | `<data-dir>/css/site.css` (shared)                       |
+| `webprism.local/assets/nyaa/style.css` | `rules/nyaa/style.css`, else `<data-dir>/nyaa/style.css` |
+
+Shared assets live in the XDG data directory (`--data-dir`, default
+`~/.local/share/web-sieve/`), alongside `templates/`. Per-script assets ship
+with a community script in its own folder:
+
+```
+rules/
+├── 10-reddit-clean.star          # a plain top-level rule
+└── nyaa/                         # a script with its own assets
+    ├── nyaa.star
+    ├── icon.svg
+    └── style.css
+```
+
+Rules in a `rules/<script>/` folder are loaded just like top-level ones (one
+level deep), and that folder's files are served under
+`webprism.local/assets/nyaa/…`, taking precedence over a shared file of the
+same name. The `.star` itself is never served — rule sources stay private.
+
+### Inlining assets into templates
+
+Prefer inlining: it saves a round-trip and works regardless of CORS.
+
+```html
+<style>{{ inline_asset("css/site.css") }}</style>
+<style>{{ inline_asset("nyaa/style.css") }}</style>   {# per-script asset #}
+```
+
+`inline_asset()` returns the file verbatim — it is **not** HTML-escaped, so
+only inline files you control. A missing asset renders as an empty string and
+logs a warning rather than failing the page.
+
+For files too large or too binary to inline, link to them:
+
+```html
+<link rel="stylesheet" href="{{ asset_url('css/site.css') }}">
+<img src="{{ asset_url('nyaa/icon.svg') }}">
+```
+
+### Hot-reloading
+
+Assets are read from disk on every request, so edits are live immediately —
+there is nothing to restart or invalidate. Templates and `.star` rules are
+watched and reloaded as described above.
+
+### CORS
+
+By default assets are same-origin: no `Access-Control-Allow-Origin` header is
+sent at all. To let another origin fetch them, pass `--cors-allow-origin` (it
+repeats, and accepts `*`):
+
+```sh
+web-sieve --cors-allow-origin https://example.com --cors-allow-origin https://other.test
+```
+
+Only `GET`, `HEAD`, and `OPTIONS` are accepted; anything else returns `405`.
 
 ## Execution order and rule interaction
 

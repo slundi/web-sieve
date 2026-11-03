@@ -222,16 +222,47 @@
 - A dedicated `notify` watcher on the templates directory rebuilds the whole
   template set on create/modify/remove.
 
-### Step 6.5 — Static Asset Serving & Local Proxy Endpoint
+### Step 6.5 — Static Asset Serving & Local Proxy Endpoint ✅
 
 - Proxy intercepts requests to `webprism.local` by hostname match — no DNS or `/etc/hosts` entry required.
+  Matching ignores case and port. Overridable with `--asset-host`.
+  Both legs work: plain HTTP (`forward_http` answers before any upstream connect)
+  and HTTPS, where a CONNECT to the asset host is terminated locally by
+  `do_local_mitm` with a leaf certificate and never opens an upstream socket.
 - Two asset sources, both served under `webprism.local`:
   - **Shared assets** (`css`, `js`, `fonts`, `scripts`, `templates`) live in the XDG data directory so users can add or override files, served at `webprism.local/assets/…`.
+    The root is `--data-dir` (default `~/.local/share/web-sieve`).
   - **Per-script assets** ship alongside a community script in its own folder (e.g. `rules/<script>/` containing the `.star` plus `icon`, `css`, `js`), served under a namespaced path `webprism.local/assets/<script>/…`.
   - Per-script assets take precedence over shared assets for namespaced references.
+  - `ScriptEngine` now also loads `rules/<script>/<name>.star`, one level deep, so
+    a script shipped in its own folder is active — without this the layout above
+    would serve assets for a rule that never ran.
 - Prefer inlining assets into templates to avoid extra round-trips; both directories are also served for files that cannot be inlined.
+  Templates get `inline_asset(path)` (splices the file in, marked safe so CSS/JS
+  is not escaped) and `asset_url(path)` for files too large to inline.
 - Extend the `notify` watcher to cover both the XDG asset directory and per-script asset folders under the rules directory.
+  The rules watcher is now recursive, so per-script folders hot-reload.
+  **Deviation:** assets themselves are _not_ watched or cached — they are read
+  from disk per request, so an edit is live on the next request with no
+  staleness window. A watcher would only have served to invalidate a cache that
+  does not exist.
 - CORS: default same-origin (`webprism.local` only); configurable `Access-Control-Allow-Origin` allowlist for cross-origin use.
+  `--cors-allow-origin` is repeatable and accepts `*`. With no flag, no
+  `Access-Control-Allow-Origin` header is emitted at all. Allowlisted responses
+  also carry `Vary: Origin`. `OPTIONS` preflights are answered `204`; anything
+  other than `GET`/`HEAD`/`OPTIONS` gets `405`.
+- Path safety: request paths are percent-decoded, then `..`, dotfiles,
+  backslashes, and NUL bytes are rejected; the resolved path is canonicalised
+  and must stay under its root, so a symlink cannot escape.
+- `.star` files are never served even though they sit inside a served per-script
+  folder — rule sources are logic and may embed webhook tokens.
+- Refactor: the five content engines moved into a `proxy::Pipeline` struct, so
+  the per-connection call chain stays at four arguments instead of needing
+  `#[allow(clippy::too_many_arguments)]` on every hop.
+
+> **Naming:** the host is `webprism.local` as specified here, while the crate is
+> `web-sieve`. Kept as written and made configurable; rename the default in
+> `assets::DEFAULT_ASSET_HOST` if the discrepancy was unintended.
 
 ## Ideas
 

@@ -27,10 +27,20 @@ pub struct Config {
     pub lists_dir: PathBuf,
     /// Directory containing content-scanner dictionary files (*.txt, one term per line).
     pub dicts_dir: PathBuf,
-    /// Directory containing Minijinja display templates, in the XDG *data*
-    /// directory (not the config one) because templates are shareable content
-    /// rather than machine-local settings.
+    /// XDG *data* directory (not the config one): the root for shareable
+    /// content rather than machine-local settings.  Holds `css/`, `js/`,
+    /// `fonts/`, `scripts/`, and `templates/`, and is the shared asset root
+    /// served under `<asset_host>/assets/…`.
+    pub data_dir: PathBuf,
+    /// Directory containing Minijinja display templates.  Defaults to
+    /// `data_dir/templates` but may be pointed elsewhere independently.
     pub templates_dir: PathBuf,
+    /// Hostname the proxy answers locally for static assets, bypassing any
+    /// upstream connection.  Default: `webprism.local`.
+    pub asset_host: String,
+    /// Origins permitted to read assets cross-origin.  Empty — the default —
+    /// keeps assets same-origin; `*` allows any origin.
+    pub cors_allow_origins: Vec<String>,
     /// Density threshold for semantic blocking: hits-per-byte ratio above which
     /// a Starlark rule may call `block_page()`.  Exposed to scripts via
     /// `density_threshold()`.  Default: `0.01` (1 hit per 100 bytes).
@@ -44,6 +54,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let config_dir = config_dir();
+        let data_dir = data_dir();
         Self {
             bind_addr: "127.0.0.1:8080"
                 .parse()
@@ -53,7 +64,10 @@ impl Default for Config {
             rules_dir: config_dir.join("rules"),
             lists_dir: config_dir.join("lists"),
             dicts_dir: config_dir.join("dicts"),
-            templates_dir: data_dir().join("templates"),
+            templates_dir: data_dir.join("templates"),
+            data_dir,
+            asset_host: crate::assets::DEFAULT_ASSET_HOST.to_string(),
+            cors_allow_origins: Vec::new(),
             density_threshold: 0.01,
             cert_cache_capacity: 2048,
         }
@@ -132,6 +146,28 @@ mod tests {
         assert!(
             !config.templates_dir.starts_with(&config.rules_dir),
             "templates must live in the data dir, not under the rules dir"
+        );
+    }
+
+    #[test]
+    fn test_default_templates_dir_sits_under_data_dir() {
+        let config = Config::default();
+        assert!(
+            config.templates_dir.starts_with(&config.data_dir),
+            "templates dir must default to a child of the data dir"
+        );
+    }
+
+    #[test]
+    fn test_default_asset_host() {
+        assert_eq!(Config::default().asset_host, "webprism.local");
+    }
+
+    #[test]
+    fn test_default_cors_allow_origins_is_empty() {
+        assert!(
+            Config::default().cors_allow_origins.is_empty(),
+            "assets must default to same-origin only"
         );
     }
 

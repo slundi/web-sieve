@@ -389,14 +389,7 @@ impl ScriptEngine {
         tokio::fs::create_dir_all(&rules_dir).await?;
 
         // 2. Load all existing .star files in sorted order for deterministic rule application.
-        let mut star_paths: Vec<std::path::PathBuf> = Vec::new();
-        let mut read_dir = tokio::fs::read_dir(&rules_dir).await?;
-        while let Some(entry) = read_dir.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("star") {
-                star_paths.push(path);
-            }
-        }
+        let mut star_paths = collect_star_files(&rules_dir).await?;
         star_paths.sort_unstable();
         let mut initial_rules: Vec<LoadedRule> = Vec::new();
         for path in &star_paths {
@@ -415,7 +408,9 @@ impl ScriptEngine {
         let mut watcher = recommended_watcher(move |res| {
             let _ = tx.blocking_send(res);
         })?;
-        watcher.watch(&rules_dir, RecursiveMode::NonRecursive)?;
+        // Recursive so a community script shipped as `rules/<script>/<name>.star`
+        // alongside its assets hot-reloads like a top-level rule.
+        watcher.watch(&rules_dir, RecursiveMode::Recursive)?;
 
         // 4. Spawn background task for hot-reload.
         let rules_for_task = Arc::clone(&rules);
@@ -465,6 +460,50 @@ impl ScriptEngine {
 }
 
 // ─── Private helpers ─────────────────────────────────────────────────────────
+
+/// Collect every `.star` file in `rules_dir` and in its immediate
+/// subdirectories.
+///
+/// One level of nesting is enough for the per-script layout
+/// (`rules/<script>/<script>.star` next to that script's `css`, `js`, and
+/// `icon`), and bounding the depth keeps a deep or looping directory tree from
+/// stalling startup.
+async fn collect_star_files(rules_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    fn is_star(path: &Path) -> bool {
+        path.extension().and_then(|e| e.to_str()) == Some("star")
+    }
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut read_dir = tokio::fs::read_dir(rules_dir).await?;
+    while let Some(entry) = read_dir.next_entry().await? {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type().await else {
+            continue;
+        };
+
+        if file_type.is_file() {
+            if is_star(&path) {
+                found.push(path);
+            }
+            continue;
+        }
+
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(mut nested) = tokio::fs::read_dir(&path).await else {
+            tracing::warn!(path = %path.display(), "cannot read script folder, skipping");
+            continue;
+        };
+        while let Some(nested_entry) = nested.next_entry().await? {
+            let nested_path = nested_entry.path();
+            if nested_path.is_file() && is_star(&nested_path) {
+                found.push(nested_path);
+            }
+        }
+    }
+    Ok(found)
+}
 
 /// Compile a `.star` file into a [`LoadedRule`].
 ///
@@ -1065,6 +1104,58 @@ def process(request):
             "example.com/path"
         );
         assert_eq!(strip_host_path("example.com/path"), "example.com/path");
+    }
+
+    #[tokio::test]
+    async fn test_collect_star_files_finds_top_level_and_nested() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("top.star"), "x").expect("write top");
+        std::fs::create_dir_all(tmp.path().join("nyaa")).expect("mkdir");
+        std::fs::write(tmp.path().join("nyaa/nyaa.star"), "x").expect("write nested");
+        // Non-star files and nested assets must be ignored.
+        std::fs::write(tmp.path().join("notes.txt"), "x").expect("write txt");
+        std::fs::write(tmp.path().join("nyaa/style.css"), "x").expect("write css");
+
+        let mut found = collect_star_files(tmp.path()).await.expect("collect");
+        found.sort_unstable();
+        assert_eq!(found.len(), 2, "expected 2 .star files: {found:?}");
+        assert!(found.iter().any(|p| p.ends_with("top.star")));
+        assert!(found.iter().any(|p| p.ends_with("nyaa/nyaa.star")));
+    }
+
+    #[tokio::test]
+    async fn test_collect_star_files_ignores_second_level_nesting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("a/b")).expect("mkdir");
+        std::fs::write(tmp.path().join("a/b/deep.star"), "x").expect("write deep");
+
+        let found = collect_star_files(tmp.path()).await.expect("collect");
+        assert!(
+            found.is_empty(),
+            "only one level of nesting is scanned: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_script_engine_loads_rule_from_per_script_folder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("nyaa")).expect("mkdir");
+        std::fs::write(
+            tmp.path().join("nyaa/nyaa.star"),
+            "URLS = [\"example.com\"]\ndef process(request):\n    block_page()\n",
+        )
+        .expect("write");
+
+        let engine = ScriptEngine::new(tmp.path().to_path_buf(), 0.01)
+            .await
+            .expect("ScriptEngine::new");
+
+        let c = ctx("http://example.com/");
+        let ops = tokio::task::spawn_blocking(move || engine.run_rules(&c))
+            .await
+            .expect("spawn_blocking");
+        assert_eq!(ops.len(), 1, "rule in rules/<script>/ must load: {ops:?}");
+        assert!(matches!(ops[0], RewriteOp::BlockPage));
     }
 
     #[tokio::test]

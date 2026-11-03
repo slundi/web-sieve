@@ -25,6 +25,7 @@ use rustls_pki_types::ServerName;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+use crate::assets::{self, AssetServer};
 use crate::error::ProxyError;
 use crate::filter::AdBlockEngine;
 use crate::proxy::ca::CertificateAuthority;
@@ -58,6 +59,95 @@ fn nested_connect_response() -> Response<BoxBody> {
         .expect("valid response")
 }
 
+/// Build the HTTP response for a request aimed at the local asset host.
+///
+/// Serves files under `/assets/…` from the shared and per-script roots,
+/// answers `OPTIONS` preflights, and returns `404` for anything else — the
+/// asset host has no upstream to fall back to.
+///
+/// CORS headers are emitted only when the request's `Origin` is allowlisted
+/// (or the allowlist is `*`); with the default empty allowlist the assets stay
+/// same-origin.
+/// Generic over the request body because only the head is inspected; the body
+/// of a GET/HEAD/OPTIONS is irrelevant here.
+async fn serve_asset<B>(req: &Request<B>, assets: &AssetServer) -> Response<BoxBody> {
+    let origin = req
+        .headers()
+        .get(hyper::header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    let allow_origin = assets.cors_allow_origin(origin);
+
+    /// Attach the CORS headers common to every asset-host response.
+    fn with_cors(
+        builder: hyper::http::response::Builder,
+        allow_origin: Option<&String>,
+    ) -> hyper::http::response::Builder {
+        match allow_origin {
+            None => builder,
+            Some(value) => builder
+                .header(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, value)
+                .header(hyper::header::VARY, "Origin"),
+        }
+    }
+
+    if req.method() == Method::OPTIONS {
+        return with_cors(
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(
+                    hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
+                    "GET, HEAD, OPTIONS",
+                )
+                .header(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type"),
+            allow_origin.as_ref(),
+        )
+        .body(empty_body())
+        .expect("valid response");
+    }
+
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        return Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(hyper::header::ALLOW, "GET, HEAD, OPTIONS")
+            .body(empty_body())
+            .expect("valid response");
+    }
+
+    let Some(rel_path) = assets::strip_asset_prefix(req.uri().path()) else {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(full_body("Not found"))
+            .expect("valid response");
+    };
+
+    let Some(asset) = assets.load(rel_path).await else {
+        tracing::debug!(path = %req.uri().path(), "asset not found");
+        return with_cors(
+            Response::builder().status(StatusCode::NOT_FOUND),
+            allow_origin.as_ref(),
+        )
+        .body(full_body("Not found"))
+        .expect("valid response");
+    };
+
+    let length = asset.bytes.len();
+    let builder = with_cors(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, asset.content_type)
+            .header(hyper::header::CONTENT_LENGTH, length),
+        allow_origin.as_ref(),
+    );
+
+    // HEAD must carry the headers of the GET it mirrors, but no body.
+    let body = if req.method() == Method::HEAD {
+        empty_body()
+    } else {
+        full_body(asset.bytes)
+    };
+    builder.body(body).expect("valid response")
+}
+
 /// Rewrite the `Host` request header to the effective upstream host.
 ///
 /// Called after a subdomain activation trigger redirects the upstream target:
@@ -85,6 +175,23 @@ fn header_pairs(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The content-processing engines shared by every connection.
+///
+/// Bundled into one value so the per-connection call chain keeps a stable,
+/// readable signature as the pipeline grows.
+pub struct Pipeline {
+    /// Starlark rule engine.
+    pub engine: Arc<ScriptEngine>,
+    /// Network and cosmetic ad-block engine.
+    pub blocker: Arc<AdBlockEngine>,
+    /// Aho-Corasick content scanner.
+    pub scanner: Arc<TextScanner>,
+    /// Minijinja template engine.
+    pub templates: Arc<TemplateEngine>,
+    /// Static asset server for the local endpoint.
+    pub assets: Arc<AssetServer>,
+}
+
 /// Start the proxy listener and serve connections forever.
 ///
 /// Binds to `addr`, accepts TCP connections, and dispatches each to
@@ -97,13 +204,15 @@ pub async fn run(
     addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
     profiles: Arc<FingerprintProfiles>,
-    engine: Arc<ScriptEngine>,
-    blocker: Arc<AdBlockEngine>,
-    scanner: Arc<TextScanner>,
-    templates: Arc<TemplateEngine>,
+    pipeline: Arc<Pipeline>,
 ) -> Result<(), ProxyError> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("proxy listening on {addr}");
+    tracing::info!(
+        "serving local assets at http://{}{}",
+        pipeline.assets.host(),
+        assets::ASSET_PREFIX
+    );
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -111,15 +220,10 @@ pub async fn run(
 
         let ca = Arc::clone(&ca);
         let profiles = Arc::clone(&profiles);
-        let engine = Arc::clone(&engine);
-        let blocker = Arc::clone(&blocker);
-        let scanner = Arc::clone(&scanner);
-        let templates = Arc::clone(&templates);
+        let pipeline = Arc::clone(&pipeline);
 
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection(stream, ca, profiles, engine, blocker, scanner, templates).await
-            {
+            if let Err(err) = handle_connection(stream, ca, profiles, pipeline).await {
                 tracing::warn!("connection error from {peer}: {err}");
             }
         });
@@ -131,10 +235,7 @@ async fn handle_connection(
     stream: TcpStream,
     ca: Arc<CertificateAuthority>,
     profiles: Arc<FingerprintProfiles>,
-    engine: Arc<ScriptEngine>,
-    blocker: Arc<AdBlockEngine>,
-    scanner: Arc<TextScanner>,
-    templates: Arc<TemplateEngine>,
+    pipeline: Arc<Pipeline>,
 ) -> Result<(), ProxyError> {
     let io = TokioIo::new(stream);
     server_http1::Builder::new()
@@ -144,13 +245,8 @@ async fn handle_connection(
             service_fn(move |req| {
                 let ca = Arc::clone(&ca);
                 let profiles = Arc::clone(&profiles);
-                let engine = Arc::clone(&engine);
-                let blocker = Arc::clone(&blocker);
-                let scanner = Arc::clone(&scanner);
-                let templates = Arc::clone(&templates);
-                async move {
-                    proxy_request(req, ca, profiles, engine, blocker, scanner, templates).await
-                }
+                let pipeline = Arc::clone(&pipeline);
+                async move { proxy_request(req, ca, profiles, pipeline).await }
             }),
         )
         .with_upgrades()
@@ -158,21 +254,18 @@ async fn handle_connection(
         .map_err(ProxyError::Http)
 }
 
-/// Route a request to either [`handle_connect`] or [`forward_http`].
-#[allow(clippy::too_many_arguments)]
+/// Route a request to the local asset endpoint, [`handle_connect`], or
+/// [`forward_http`].
 async fn proxy_request(
     req: Request<Incoming>,
     ca: Arc<CertificateAuthority>,
     profiles: Arc<FingerprintProfiles>,
-    engine: Arc<ScriptEngine>,
-    blocker: Arc<AdBlockEngine>,
-    scanner: Arc<TextScanner>,
-    templates: Arc<TemplateEngine>,
+    pipeline: Arc<Pipeline>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     if req.method() == Method::CONNECT {
-        handle_connect(req, ca, profiles, engine, blocker, scanner, templates).await
+        handle_connect(req, ca, profiles, pipeline).await
     } else {
-        forward_http(req, engine, blocker, scanner, templates).await
+        forward_http(req, pipeline).await
     }
 }
 
@@ -197,15 +290,11 @@ struct RoutingTarget {
 ///
 /// Returns `200 Connection Established` immediately, then upgrades the
 /// connection and performs the TLS handshake in a background task.
-#[allow(clippy::too_many_arguments)]
 async fn handle_connect(
     req: Request<Incoming>,
     ca: Arc<CertificateAuthority>,
     profiles: Arc<FingerprintProfiles>,
-    engine: Arc<ScriptEngine>,
-    blocker: Arc<AdBlockEngine>,
-    scanner: Arc<TextScanner>,
-    templates: Arc<TemplateEngine>,
+    pipeline: Arc<Pipeline>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     let authority = req
         .uri()
@@ -215,6 +304,28 @@ async fn handle_connect(
 
     let client_authority = authority.host().to_string();
     let connect_port = authority.port_u16().unwrap_or(443);
+
+    // A CONNECT to the asset host is terminated locally: MITM it with a leaf
+    // certificate for that name, then serve files without any upstream — the
+    // host deliberately has no DNS record to connect to.
+    if pipeline.assets.matches_host(&client_authority) {
+        let upgrade = hyper::upgrade::on(req);
+        let assets = Arc::clone(&pipeline.assets);
+        tokio::spawn(async move {
+            match upgrade.await {
+                Ok(upgraded) => {
+                    if let Err(err) = do_local_mitm(upgraded, &client_authority, ca, assets).await {
+                        tracing::warn!("local asset MITM error: {err}");
+                    }
+                }
+                Err(err) => tracing::warn!("upgrade error: {err}"),
+            }
+        });
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(empty_body())
+            .expect("valid response"));
+    }
 
     // A CONNECT tunnel to `<mode>.<proto>.<real_host>` rewrites the effective
     // upstream target so the browser sees the trigger subdomain (with its own
@@ -277,18 +388,7 @@ async fn handle_connect(
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
-                if let Err(err) = do_mitm(
-                    upgraded,
-                    target,
-                    ca,
-                    profile_config,
-                    engine,
-                    blocker,
-                    scanner,
-                    templates,
-                )
-                .await
-                {
+                if let Err(err) = do_mitm(upgraded, target, ca, profile_config, pipeline).await {
                     tracing::warn!("MITM error: {err}");
                 }
             }
@@ -308,16 +408,12 @@ async fn handle_connect(
 /// then connects to the upstream server using the browser-matched TLS profile
 /// and forwards each HTTP request.  Network-blocked requests are answered with
 /// `204 No Content` without touching the upstream.
-#[allow(clippy::too_many_arguments)]
 async fn do_mitm(
     upgraded: hyper::upgrade::Upgraded,
     target: RoutingTarget,
     ca: Arc<CertificateAuthority>,
     client_config: Arc<ClientConfig>,
-    engine: Arc<ScriptEngine>,
-    blocker: Arc<AdBlockEngine>,
-    scanner: Arc<TextScanner>,
-    templates: Arc<TemplateEngine>,
+    pipeline: Arc<Pipeline>,
 ) -> Result<(), ProxyError> {
     let RoutingTarget {
         client_authority,
@@ -372,22 +468,43 @@ async fn do_mitm(
             TokioIo::new(client_tls),
             service_fn(move |req: Request<Incoming>| {
                 let sender = Arc::clone(&sender);
-                let engine = Arc::clone(&engine);
-                let blocker = Arc::clone(&blocker);
-                let scanner = Arc::clone(&scanner);
-                let templates = Arc::clone(&templates);
+                let pipeline = Arc::clone(&pipeline);
                 let upstream_host = upstream_host.clone();
                 let subdomain_mode = subdomain_mode.clone();
-                handle_mitm_request(
-                    req,
-                    sender,
-                    engine,
-                    blocker,
-                    scanner,
-                    templates,
-                    upstream_host,
-                    subdomain_mode,
-                )
+                handle_mitm_request(req, sender, pipeline, upstream_host, subdomain_mode)
+            }),
+        )
+        .await
+        .map_err(|e| ProxyError::ServerConnection(e.to_string()))
+}
+
+/// Terminate a CONNECT tunnel aimed at the local asset host.
+///
+/// Accepts the client TLS handshake with a leaf certificate for the asset
+/// host, then serves only static assets — there is no upstream connection, so
+/// nothing leaves the machine. Both HTTP/1.1 and HTTP/2 are supported via the
+/// same ALPN negotiation as the regular MITM path.
+async fn do_local_mitm(
+    upgraded: hyper::upgrade::Upgraded,
+    authority: &str,
+    ca: Arc<CertificateAuthority>,
+    assets: Arc<AssetServer>,
+) -> Result<(), ProxyError> {
+    let server_cfg = ca.server_config(authority)?;
+    let acceptor = TlsAcceptor::from(server_cfg);
+    let client_tls = acceptor
+        .accept(TokioIo::new(upgraded))
+        .await
+        .map_err(ProxyError::Io)?;
+
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http1().preserve_header_case(true);
+    builder
+        .serve_connection(
+            TokioIo::new(client_tls),
+            service_fn(move |req: Request<Incoming>| {
+                let assets = Arc::clone(&assets);
+                async move { Ok::<_, ProxyError>(serve_asset(&req, &assets).await) }
             }),
         )
         .await
@@ -408,17 +525,21 @@ type UpstreamSender = Arc<Mutex<hyper::client::conn::http1::SendRequest<BoxBody>
 /// [`hyper_util::server::conn::auto`]).  Each h2 stream runs this function
 /// on its own tokio task, so `lol-html` rewriting runs per-stream in
 /// parallel.
-#[allow(clippy::too_many_arguments)]
 async fn handle_mitm_request(
     req: Request<Incoming>,
     sender: UpstreamSender,
-    engine: Arc<ScriptEngine>,
-    blocker: Arc<AdBlockEngine>,
-    scanner: Arc<TextScanner>,
-    templates: Arc<TemplateEngine>,
+    pipeline: Arc<Pipeline>,
     upstream_host: String,
     subdomain_mode: Option<String>,
 ) -> Result<Response<BoxBody>, ProxyError> {
+    let Pipeline {
+        engine,
+        blocker,
+        scanner,
+        templates,
+        assets: _,
+    } = &*pipeline;
+
     // Nested MITM (CONNECT-inside-h2, extended CONNECT for WebSockets over
     // h2, MASQUE, …) is not supported — return 501 to keep the surface
     // small.  Ordinary browsers never send CONNECT inside a MITM'd stream.
@@ -523,7 +644,8 @@ async fn handle_mitm_request(
         } else {
             None
         };
-        let engine = Arc::clone(&engine);
+        let engine = Arc::clone(engine);
+        let templates = Arc::clone(templates);
         let raw: bytes::Bytes = resp_bytes;
         let (maybe_bytes, webhook_targets) = tokio::task::spawn_blocking(move || {
             let mut ops: Vec<crate::rewriter::RewriteOp> = Vec::new();
@@ -597,12 +719,30 @@ async fn handle_mitm_request(
 /// and the scripting engine before being returned.
 async fn forward_http(
     req: Request<Incoming>,
-    engine: Arc<ScriptEngine>,
-    blocker: Arc<AdBlockEngine>,
-    scanner: Arc<TextScanner>,
-    templates: Arc<TemplateEngine>,
+    pipeline: Arc<Pipeline>,
 ) -> Result<Response<BoxBody>, ProxyError> {
+    let Pipeline {
+        engine,
+        blocker,
+        scanner,
+        templates,
+        assets,
+    } = &*pipeline;
+
     let uri = req.uri().clone();
+    // The asset host may arrive either in absolute-form (`GET http://host/…`,
+    // how a browser addresses a proxy) or, for a direct request to the proxy
+    // port, only in the `Host` header.
+    let host_header = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    if uri.host().is_some_and(|h| assets.matches_host(h))
+        || (uri.host().is_none() && host_header.is_some_and(|h| assets.matches_host(h)))
+    {
+        return Ok(serve_asset(&req, assets).await);
+    }
+
     let request_host = uri
         .host()
         .ok_or_else(|| ProxyError::InvalidAuthority("missing host in HTTP request".to_string()))?
@@ -731,6 +871,8 @@ async fn forward_http(
         } else {
             None
         };
+        let engine = Arc::clone(engine);
+        let templates = Arc::clone(templates);
         let raw = resp_bytes;
         let (maybe_bytes, webhook_targets) = tokio::task::spawn_blocking(move || {
             let mut ops: Vec<crate::rewriter::RewriteOp> = Vec::new();
@@ -841,6 +983,171 @@ mod tests {
             Bytes::from_static(b"CONNECT inside MITM'd stream is not supported"),
             "501 body must state the reason for the browser extension / user"
         );
+    }
+
+    // ─── serve_asset ──────────────────────────────────────────────────────
+
+    /// Build an [`AssetServer`] over a temp dir seeded with `css/site.css`.
+    ///
+    /// The tempdir is returned so the caller keeps it alive for the test.
+    fn asset_fixture(cors: Vec<String>) -> (tempfile::TempDir, AssetServer) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("data/css")).expect("mkdir data");
+        std::fs::create_dir_all(dir.path().join("rules")).expect("mkdir rules");
+        std::fs::write(dir.path().join("data/css/site.css"), "body{color:red}").expect("write");
+        let server = AssetServer::new(
+            assets::DEFAULT_ASSET_HOST.to_string(),
+            dir.path().join("data"),
+            dir.path().join("rules"),
+            cors,
+        );
+        (dir, server)
+    }
+
+    /// Issue `method` + `path` (with an optional `Origin`) at the asset server.
+    async fn asset_request(
+        server: &AssetServer,
+        method: Method,
+        path: &str,
+        origin: Option<&str>,
+    ) -> Response<BoxBody> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(format!("http://webprism.local{path}"));
+        if let Some(value) = origin {
+            builder = builder.header(hyper::header::ORIGIN, value);
+        }
+        serve_asset(&builder.body(()).expect("request"), server).await
+    }
+
+    #[tokio::test]
+    async fn test_serve_asset_returns_file_with_content_type() {
+        let (_dir, server) = asset_fixture(Vec::new());
+        let resp = asset_request(&server, Method::GET, "/assets/css/site.css", None).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[hyper::header::CONTENT_TYPE],
+            "text/css; charset=utf-8"
+        );
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        assert_eq!(body, Bytes::from_static(b"body{color:red}"));
+    }
+
+    #[tokio::test]
+    async fn test_serve_asset_head_has_headers_but_no_body() {
+        let (_dir, server) = asset_fixture(Vec::new());
+        let resp = asset_request(&server, Method::HEAD, "/assets/css/site.css", None).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[hyper::header::CONTENT_LENGTH], "15");
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        assert!(body.is_empty(), "HEAD must not carry a body");
+    }
+
+    #[tokio::test]
+    async fn test_serve_asset_missing_file_is_404() {
+        let (_dir, server) = asset_fixture(Vec::new());
+        let resp = asset_request(&server, Method::GET, "/assets/css/absent.css", None).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_serve_asset_outside_prefix_is_404() {
+        let (_dir, server) = asset_fixture(Vec::new());
+        let resp = asset_request(&server, Method::GET, "/index.html", None).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "the asset host serves nothing outside /assets/"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_asset_rejects_write_methods() {
+        let (_dir, server) = asset_fixture(Vec::new());
+        let resp = asset_request(&server, Method::POST, "/assets/css/site.css", None).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.headers()[hyper::header::ALLOW], "GET, HEAD, OPTIONS");
+    }
+
+    #[tokio::test]
+    async fn test_serve_asset_default_emits_no_cors_header() {
+        let (_dir, server) = asset_fixture(Vec::new());
+        let resp = asset_request(
+            &server,
+            Method::GET,
+            "/assets/css/site.css",
+            Some("https://example.com"),
+        )
+        .await;
+        assert!(
+            !resp
+                .headers()
+                .contains_key(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "assets are same-origin unless an allowlist is configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_asset_allowlisted_origin_gets_cors_header() {
+        let (_dir, server) = asset_fixture(vec!["https://example.com".to_string()]);
+        let resp = asset_request(
+            &server,
+            Method::GET,
+            "/assets/css/site.css",
+            Some("https://example.com"),
+        )
+        .await;
+        assert_eq!(
+            resp.headers()[hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://example.com"
+        );
+        assert_eq!(
+            resp.headers()[hyper::header::VARY],
+            "Origin",
+            "a per-origin response must not be cached across origins"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_asset_preflight_returns_allowed_methods() {
+        let (_dir, server) = asset_fixture(vec!["*".to_string()]);
+        let resp = asset_request(
+            &server,
+            Method::OPTIONS,
+            "/assets/css/site.css",
+            Some("https://any.test"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers()[hyper::header::ACCESS_CONTROL_ALLOW_METHODS],
+            "GET, HEAD, OPTIONS"
+        );
+        assert_eq!(
+            resp.headers()[hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "*"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_asset_rejects_path_traversal() {
+        let (dir, server) = asset_fixture(Vec::new());
+        std::fs::write(dir.path().join("secret.txt"), "SECRET").expect("write secret");
+
+        for path in [
+            "/assets/../secret.txt",
+            "/assets/css/../../secret.txt",
+            "/assets/%2e%2e/secret.txt",
+        ] {
+            let resp = asset_request(&server, Method::GET, path, None).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "traversal via {path} must not escape the asset root"
+            );
+        }
     }
 
     #[test]

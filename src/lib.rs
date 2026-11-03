@@ -2,6 +2,7 @@
 //!
 //! Re-exports the public surface of the library modules.
 
+pub mod assets;
 pub mod config;
 pub mod error;
 pub mod filter;
