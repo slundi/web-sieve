@@ -11,7 +11,7 @@ use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::Value;
-use starlark::values::dict::AllocDict;
+use starlark::values::dict::{AllocDict, DictRef};
 use starlark::values::list::ListRef;
 use starlark::values::none::NoneType;
 use tokio::sync::RwLock;
@@ -183,6 +183,37 @@ fn proxy_globals(builder: &mut GlobalsBuilder) {
     /// Switch the page to reader mode (extracts main article, replaces document).
     fn enable_reader_mode() -> anyhow::Result<NoneType> {
         PENDING_OPS.with(|ops| ops.borrow_mut().push(RewriteOp::ReaderMode));
+        Ok(NoneType)
+    }
+
+    /// Replace the page with the Minijinja template `name`, rendered against
+    /// `context`.
+    ///
+    /// `context` must be a dict; it is JSON-encoded here and decoded by the
+    /// rewriter, so every value in it must be JSON-representable (str, int,
+    /// float, bool, None, list, dict).
+    ///
+    /// Example:
+    /// ```python
+    /// def process(request):
+    ///     render_template("torrent-list", {"title": page_title()})
+    /// ```
+    fn render_template<'v>(name: String, context: Value<'v>) -> anyhow::Result<NoneType> {
+        if DictRef::from_value(context).is_none() {
+            return Err(anyhow::anyhow!(
+                "render_template('{name}'): context must be a dict, got {}",
+                context.get_type()
+            ));
+        }
+        let encoded = serde_json::to_string(&context).map_err(|e| {
+            anyhow::anyhow!("render_template('{name}'): context is not JSON-serialisable: {e}")
+        })?;
+        PENDING_OPS.with(|ops| {
+            ops.borrow_mut().push(RewriteOp::RenderTemplate {
+                name,
+                context: encoded,
+            });
+        });
         Ok(NoneType)
     }
 
@@ -723,6 +754,64 @@ def process(request):
         let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], RewriteOp::BlockPage));
+    }
+
+    #[test]
+    fn test_execute_rule_render_template_queues_op() {
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    render_template("torrent-list", {"title": "Hi", "count": 2})
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
+        assert_eq!(ops.len(), 1, "expected one op: {ops:?}");
+        let RewriteOp::RenderTemplate { name, context } = &ops[0] else {
+            panic!("expected RenderTemplate, got {:?}", ops[0]);
+        };
+        assert_eq!(name, "torrent-list");
+        let parsed: serde_json::Value = serde_json::from_str(context).expect("context is JSON");
+        assert_eq!(parsed["title"], "Hi");
+        assert_eq!(parsed["count"], 2);
+    }
+
+    #[test]
+    fn test_execute_rule_render_template_nested_context() {
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    render_template("list", {"items": [{"name": "a"}, {"name": "b"}], "ok": True})
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
+        let RewriteOp::RenderTemplate { context, .. } = &ops[0] else {
+            panic!("expected RenderTemplate, got {:?}", ops[0]);
+        };
+        let parsed: serde_json::Value = serde_json::from_str(context).expect("context is JSON");
+        assert_eq!(parsed["items"][1]["name"], "b");
+        assert_eq!(parsed["ok"], true);
+    }
+
+    #[test]
+    fn test_execute_rule_render_template_rejects_non_dict_context() {
+        let f = write_tempfile(
+            r#"
+URLS = ["example.com"]
+def process(request):
+    render_template("list", "not a dict")
+"#,
+        );
+        let rule = load_rule(f.path()).expect("load");
+        // The error aborts process(); no ops survive the failed invocation.
+        let ops = execute_rule(&rule.frozen, &ctx("http://example.com/"));
+        assert!(
+            ops.is_empty(),
+            "a non-dict context must abort the rule: {ops:?}"
+        );
     }
 
     #[test]

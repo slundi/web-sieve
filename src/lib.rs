@@ -11,3 +11,4 @@ pub mod reader;
 pub mod rewriter;
 pub mod scanner;
 pub mod scripting;
+pub mod templates;

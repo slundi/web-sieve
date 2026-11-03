@@ -31,6 +31,7 @@ use crate::proxy::ca::CertificateAuthority;
 use crate::proxy::fingerprint::FingerprintProfiles;
 use crate::scanner::TextScanner;
 use crate::scripting::{RequestCtx, ScriptEngine};
+use crate::templates::TemplateEngine;
 
 /// Shorthand body type used throughout the proxy.
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -99,6 +100,7 @@ pub async fn run(
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
     scanner: Arc<TextScanner>,
+    templates: Arc<TemplateEngine>,
 ) -> Result<(), ProxyError> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("proxy listening on {addr}");
@@ -112,10 +114,11 @@ pub async fn run(
         let engine = Arc::clone(&engine);
         let blocker = Arc::clone(&blocker);
         let scanner = Arc::clone(&scanner);
+        let templates = Arc::clone(&templates);
 
         tokio::spawn(async move {
             if let Err(err) =
-                handle_connection(stream, ca, profiles, engine, blocker, scanner).await
+                handle_connection(stream, ca, profiles, engine, blocker, scanner, templates).await
             {
                 tracing::warn!("connection error from {peer}: {err}");
             }
@@ -131,6 +134,7 @@ async fn handle_connection(
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
     scanner: Arc<TextScanner>,
+    templates: Arc<TemplateEngine>,
 ) -> Result<(), ProxyError> {
     let io = TokioIo::new(stream);
     server_http1::Builder::new()
@@ -143,7 +147,10 @@ async fn handle_connection(
                 let engine = Arc::clone(&engine);
                 let blocker = Arc::clone(&blocker);
                 let scanner = Arc::clone(&scanner);
-                async move { proxy_request(req, ca, profiles, engine, blocker, scanner).await }
+                let templates = Arc::clone(&templates);
+                async move {
+                    proxy_request(req, ca, profiles, engine, blocker, scanner, templates).await
+                }
             }),
         )
         .with_upgrades()
@@ -152,6 +159,7 @@ async fn handle_connection(
 }
 
 /// Route a request to either [`handle_connect`] or [`forward_http`].
+#[allow(clippy::too_many_arguments)]
 async fn proxy_request(
     req: Request<Incoming>,
     ca: Arc<CertificateAuthority>,
@@ -159,11 +167,12 @@ async fn proxy_request(
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
     scanner: Arc<TextScanner>,
+    templates: Arc<TemplateEngine>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     if req.method() == Method::CONNECT {
-        handle_connect(req, ca, profiles, engine, blocker, scanner).await
+        handle_connect(req, ca, profiles, engine, blocker, scanner, templates).await
     } else {
-        forward_http(req, engine, blocker, scanner).await
+        forward_http(req, engine, blocker, scanner, templates).await
     }
 }
 
@@ -188,6 +197,7 @@ struct RoutingTarget {
 ///
 /// Returns `200 Connection Established` immediately, then upgrades the
 /// connection and performs the TLS handshake in a background task.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connect(
     req: Request<Incoming>,
     ca: Arc<CertificateAuthority>,
@@ -195,6 +205,7 @@ async fn handle_connect(
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
     scanner: Arc<TextScanner>,
+    templates: Arc<TemplateEngine>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     let authority = req
         .uri()
@@ -274,6 +285,7 @@ async fn handle_connect(
                     engine,
                     blocker,
                     scanner,
+                    templates,
                 )
                 .await
                 {
@@ -296,6 +308,7 @@ async fn handle_connect(
 /// then connects to the upstream server using the browser-matched TLS profile
 /// and forwards each HTTP request.  Network-blocked requests are answered with
 /// `204 No Content` without touching the upstream.
+#[allow(clippy::too_many_arguments)]
 async fn do_mitm(
     upgraded: hyper::upgrade::Upgraded,
     target: RoutingTarget,
@@ -304,6 +317,7 @@ async fn do_mitm(
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
     scanner: Arc<TextScanner>,
+    templates: Arc<TemplateEngine>,
 ) -> Result<(), ProxyError> {
     let RoutingTarget {
         client_authority,
@@ -361,6 +375,7 @@ async fn do_mitm(
                 let engine = Arc::clone(&engine);
                 let blocker = Arc::clone(&blocker);
                 let scanner = Arc::clone(&scanner);
+                let templates = Arc::clone(&templates);
                 let upstream_host = upstream_host.clone();
                 let subdomain_mode = subdomain_mode.clone();
                 handle_mitm_request(
@@ -369,6 +384,7 @@ async fn do_mitm(
                     engine,
                     blocker,
                     scanner,
+                    templates,
                     upstream_host,
                     subdomain_mode,
                 )
@@ -399,6 +415,7 @@ async fn handle_mitm_request(
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
     scanner: Arc<TextScanner>,
+    templates: Arc<TemplateEngine>,
     upstream_host: String,
     subdomain_mode: Option<String>,
 ) -> Result<Response<BoxBody>, ProxyError> {
@@ -536,7 +553,7 @@ async fn handle_mitm_request(
             } else {
                 (
                     Some(
-                        crate::rewriter::apply(&ops, &raw)
+                        crate::rewriter::apply_with_templates(&ops, &raw, Some(&templates))
                             .map(bytes::Bytes::from)
                             .unwrap_or(raw),
                     ),
@@ -583,6 +600,7 @@ async fn forward_http(
     engine: Arc<ScriptEngine>,
     blocker: Arc<AdBlockEngine>,
     scanner: Arc<TextScanner>,
+    templates: Arc<TemplateEngine>,
 ) -> Result<Response<BoxBody>, ProxyError> {
     let uri = req.uri().clone();
     let request_host = uri
@@ -747,7 +765,7 @@ async fn forward_http(
             } else {
                 (
                     Some(
-                        crate::rewriter::apply(&ops, &raw)
+                        crate::rewriter::apply_with_templates(&ops, &raw, Some(&templates))
                             .map(bytes::Bytes::from)
                             .unwrap_or(raw),
                     ),

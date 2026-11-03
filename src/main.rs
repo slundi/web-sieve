@@ -16,6 +16,7 @@ use web_sieve::proxy::fingerprint::FingerprintProfiles;
 use web_sieve::proxy::tls::load_system_root_store;
 use web_sieve::scanner::TextScanner;
 use web_sieve::scripting::ScriptEngine;
+use web_sieve::templates::TemplateEngine;
 
 /// Command-line options for the web-sieve proxy.
 #[derive(Debug, Clone, Bpaf)]
@@ -44,6 +45,11 @@ struct Opts {
     /// Directory containing content-scanner dictionary files (*.txt, one term per line).
     #[bpaf(long("dicts-dir"), argument("PATH"), optional)]
     dicts_dir: Option<PathBuf>,
+
+    /// Directory containing Minijinja display templates (default:
+    /// `$XDG_DATA_HOME/web-sieve/templates`).
+    #[bpaf(long("templates-dir"), argument("PATH"), optional)]
+    templates_dir: Option<PathBuf>,
 
     /// Hits-per-byte density threshold for semantic blocking rules (default: 0.01).
     /// Starlark scripts read this via `density_threshold()` instead of hard-coding a value.
@@ -74,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         rules_dir: opts.rules_dir.unwrap_or(defaults.rules_dir),
         lists_dir: opts.lists_dir.unwrap_or(defaults.lists_dir),
         dicts_dir: opts.dicts_dir.unwrap_or(defaults.dicts_dir),
+        templates_dir: opts.templates_dir.unwrap_or(defaults.templates_dir),
         density_threshold: opts.density_threshold.unwrap_or(defaults.density_threshold),
         cert_cache_capacity: opts
             .cert_cache_capacity
@@ -107,9 +114,21 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to initialise text scanner")?;
 
-    web_sieve::proxy::run(config.bind_addr, ca, profiles, engine, blocker, scanner)
+    let templates = TemplateEngine::new(config.templates_dir.clone())
         .await
-        .context("proxy exited with error")?;
+        .context("failed to initialise template engine")?;
+
+    web_sieve::proxy::run(
+        config.bind_addr,
+        ca,
+        profiles,
+        engine,
+        blocker,
+        scanner,
+        templates,
+    )
+    .await
+    .context("proxy exited with error")?;
 
     Ok(())
 }

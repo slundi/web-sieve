@@ -22,6 +22,7 @@ use web_sieve::proxy::fingerprint::FingerprintProfiles;
 use web_sieve::proxy::tls::load_system_root_store;
 use web_sieve::scanner::TextScanner;
 use web_sieve::scripting::ScriptEngine;
+use web_sieve::templates::TemplateEngine;
 
 /// Install the default rustls crypto provider exactly once per test binary.
 fn setup_crypto() {
@@ -124,6 +125,10 @@ async fn start_proxy_with_extra_root(extra_root: CertificateDer<'static>) -> (So
     let dicts_dir = dir.path().join("dicts");
     let scanner = TextScanner::new(dicts_dir).await.expect("text scanner");
 
+    let templates = TemplateEngine::new(dir.path().join("templates"))
+        .await
+        .expect("template engine");
+
     // Keep tempdir alive for the duration of the test.
     std::mem::forget(dir);
 
@@ -136,9 +141,11 @@ async fn start_proxy_with_extra_root(extra_root: CertificateDer<'static>) -> (So
     drop(listener);
 
     tokio::spawn(async move {
-        web_sieve::proxy::run(proxy_addr, ca, profiles, engine, blocker, scanner)
-            .await
-            .expect("proxy run");
+        web_sieve::proxy::run(
+            proxy_addr, ca, profiles, engine, blocker, scanner, templates,
+        )
+        .await
+        .expect("proxy run");
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -206,6 +213,10 @@ async fn start_proxy() -> SocketAddr {
     let dicts_dir = dir.path().join("dicts");
     let scanner = TextScanner::new(dicts_dir).await.expect("text scanner");
 
+    let templates = TemplateEngine::new(dir.path().join("templates"))
+        .await
+        .expect("template engine");
+
     // Keep tempdir alive for the duration of the test by leaking it.
     std::mem::forget(dir);
 
@@ -217,15 +228,188 @@ async fn start_proxy() -> SocketAddr {
     drop(listener);
 
     tokio::spawn(async move {
-        web_sieve::proxy::run(proxy_addr, ca, profiles, engine, blocker, scanner)
-            .await
-            .expect("proxy run");
+        web_sieve::proxy::run(
+            proxy_addr, ca, profiles, engine, blocker, scanner, templates,
+        )
+        .await
+        .expect("proxy run");
     });
 
     // Give the proxy a moment to start listening.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     proxy_addr
+}
+
+/// Start a minimal HTTP origin that always answers `200 text/html` with `body`.
+async fn start_html_origin(body: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind html origin");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _ = server_http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |_req: Request<Incoming>| async move {
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(hyper::header::CONTENT_TYPE, "text/html")
+                                    .body(
+                                        http_body_util::Full::new(Bytes::from_static(
+                                            body.as_bytes(),
+                                        ))
+                                        .map_err(|e| match e {})
+                                        .boxed(),
+                                    )
+                                    .expect("response"),
+                            )
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
+/// Start the proxy with the given `.star` rules and Minijinja templates
+/// pre-installed, and return its address.
+async fn start_proxy_with_rules(rules: &[(&str, &str)], templates: &[(&str, &str)]) -> SocketAddr {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca = CertificateAuthority::load_or_create(
+        &dir.path().join("ca.crt"),
+        &dir.path().join("ca.key"),
+        2048,
+    )
+    .expect("CA");
+
+    let rules_dir = dir.path().join("rules");
+    std::fs::create_dir_all(&rules_dir).expect("create rules dir");
+    for (name, body) in rules {
+        std::fs::write(rules_dir.join(name), body).expect("write rule");
+    }
+    let engine = ScriptEngine::new(rules_dir, 0.01)
+        .await
+        .expect("scripting engine");
+
+    let templates_dir = dir.path().join("templates");
+    std::fs::create_dir_all(&templates_dir).expect("create templates dir");
+    for (name, body) in templates {
+        std::fs::write(templates_dir.join(name), body).expect("write template");
+    }
+    let templates = TemplateEngine::new(templates_dir)
+        .await
+        .expect("template engine");
+
+    let blocker = AdBlockEngine::new(dir.path().join("lists"))
+        .await
+        .expect("ad-block engine");
+    let scanner = TextScanner::new(dir.path().join("dicts"))
+        .await
+        .expect("text scanner");
+
+    // Keep tempdir alive for the duration of the test by leaking it.
+    std::mem::forget(dir);
+
+    let root_store = load_system_root_store();
+    let profiles = Arc::new(FingerprintProfiles::new(root_store).expect("fingerprint profiles"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let proxy_addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    tokio::spawn(async move {
+        web_sieve::proxy::run(
+            proxy_addr, ca, profiles, engine, blocker, scanner, templates,
+        )
+        .await
+        .expect("proxy run");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    proxy_addr
+}
+
+/// Fetch `uri` through the proxy at `proxy_addr` and return the response body.
+async fn get_through_proxy(proxy_addr: SocketAddr, uri: &str, host: &str) -> (StatusCode, String) {
+    let tcp = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        .await
+        .expect("handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method(hyper::Method::GET)
+        .uri(uri)
+        .header(hyper::header::HOST, host)
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+
+    let resp = sender.send_request(req).await.expect("send request");
+    let status = resp.status();
+    let body = resp.collect().await.expect("collect body").to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// End-to-end guard for [Roadmap 6.4]: a Starlark rule calling
+/// `render_template()` must replace the upstream page with the rendered
+/// Minijinja template.
+#[tokio::test]
+async fn test_render_template_replaces_page_end_to_end() {
+    let origin_addr = start_html_origin("<html><body>UPSTREAM</body></html>").await;
+    let proxy_addr = start_proxy_with_rules(
+        &[(
+            "render.star",
+            "URLS = [\"*\"]\ndef process(request):\n    render_template(\"demo\", {\"name\": \"web-sieve\"})\n",
+        )],
+        &[("demo.html", "<html><body><h1>{{ name }}</h1></body></html>")],
+    )
+    .await;
+
+    let uri = format!("http://{origin_addr}/");
+    let (status, body) = get_through_proxy(proxy_addr, &uri, &origin_addr.to_string()).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "<html><body><h1>web-sieve</h1></body></html>");
+    assert!(!body.contains("UPSTREAM"), "upstream page must be replaced");
+}
+
+/// A rule naming a template that does not exist must leave the upstream page
+/// intact rather than serving an empty or broken document.
+#[tokio::test]
+async fn test_render_template_missing_template_passes_page_through() {
+    let origin_addr = start_html_origin("<html><body>UPSTREAM</body></html>").await;
+    let proxy_addr = start_proxy_with_rules(
+        &[(
+            "render.star",
+            "URLS = [\"*\"]\ndef process(request):\n    render_template(\"absent\", {})\n",
+        )],
+        &[],
+    )
+    .await;
+
+    let uri = format!("http://{origin_addr}/");
+    let (status, body) = get_through_proxy(proxy_addr, &uri, &origin_addr.to_string()).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("UPSTREAM"),
+        "missing template must fall back to the upstream page, got: {body}"
+    );
 }
 
 /// Make a plain HTTP request through the proxy and verify we get 200 back.

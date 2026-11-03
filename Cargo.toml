@@ -41,6 +41,7 @@ hyper-util = { version = "0.1.20", features = ["full"] }
 lol_html = "3.0.0"
 lru = "0.12"
 md5 = "0.8"
+minijinja = { version = "3.0.5", features = ["serde"] }
 notify = "8.2.0"
 rcgen = "0.14.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

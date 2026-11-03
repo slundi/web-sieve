@@ -27,6 +27,10 @@ pub struct Config {
     pub lists_dir: PathBuf,
     /// Directory containing content-scanner dictionary files (*.txt, one term per line).
     pub dicts_dir: PathBuf,
+    /// Directory containing Minijinja display templates, in the XDG *data*
+    /// directory (not the config one) because templates are shareable content
+    /// rather than machine-local settings.
+    pub templates_dir: PathBuf,
     /// Density threshold for semantic blocking: hits-per-byte ratio above which
     /// a Starlark rule may call `block_page()`.  Exposed to scripts via
     /// `density_threshold()`.  Default: `0.01` (1 hit per 100 bytes).
@@ -49,6 +53,7 @@ impl Default for Config {
             rules_dir: config_dir.join("rules"),
             lists_dir: config_dir.join("lists"),
             dicts_dir: config_dir.join("dicts"),
+            templates_dir: data_dir().join("templates"),
             density_threshold: 0.01,
             cert_cache_capacity: 2048,
         }
@@ -57,13 +62,23 @@ impl Default for Config {
 
 /// Returns the web-sieve configuration directory, honouring `$XDG_CONFIG_HOME`.
 fn config_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    xdg_dir("XDG_CONFIG_HOME", ".config")
+}
+
+/// Returns the web-sieve data directory, honouring `$XDG_DATA_HOME`.
+fn data_dir() -> PathBuf {
+    xdg_dir("XDG_DATA_HOME", ".local/share")
+}
+
+/// Resolve `$<env_var>/web-sieve`, falling back to `$HOME/<fallback>/web-sieve`.
+fn xdg_dir(env_var: &str, fallback: &str) -> PathBuf {
+    let base = std::env::var_os(env_var)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let home = std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/tmp"));
-            home.join(".config")
+            home.join(fallback)
         });
     base.join("web-sieve")
 }
@@ -106,6 +121,18 @@ mod tests {
         let config = Config::default();
         assert!(config.dicts_dir.to_string_lossy().contains("web-sieve"));
         assert!(config.dicts_dir.ends_with("dicts"));
+    }
+
+    #[test]
+    fn test_default_templates_dir_under_data_dir() {
+        let config = Config::default();
+        let path = config.templates_dir.to_string_lossy().into_owned();
+        assert!(path.contains("web-sieve"), "unexpected path: {path}");
+        assert!(config.templates_dir.ends_with("templates"));
+        assert!(
+            !config.templates_dir.starts_with(&config.rules_dir),
+            "templates must live in the data dir, not under the rules dir"
+        );
     }
 
     #[test]

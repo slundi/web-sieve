@@ -132,6 +132,8 @@ src/
 │   └── mod.rs
 ├── rewriter/        # lol-html streaming HTML pipeline
 │   └── mod.rs
+├── templates/       # minijinja display templates and hot-reload
+│   └── mod.rs
 └── filter/          # aho-corasick content safety engine
     └── mod.rs
 ```

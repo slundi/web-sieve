@@ -140,9 +140,17 @@ enable_reader_mode()      # Extract the main article and replace the page with t
 ```python
 render_template(name, context)
 # Replace the page with a Minijinja template rendered against `context` (a dict).
-# Templates live in $XDG_DATA_HOME/web-sieve/templates/<name>.html
-# and are hot-reloaded on modification.
+# Templates live in $XDG_DATA_HOME/web-sieve/templates/ and are hot-reloaded.
 ```
+
+`name` may be the template's file name (`"torrent-list.html"`) or its stem
+(`"torrent-list"`). `context` must be a dict whose values are JSON-representable
+(`str`, `int`, `float`, `bool`, `None`, `list`, `dict`) — anything else aborts
+the rule with an error in the log.
+
+If the template is missing, fails to parse, or errors while rendering, the
+proxy logs a warning and serves the **upstream page unchanged** — a broken
+template never produces a broken page.
 
 See [Template authoring](#template-authoring) below.
 
@@ -253,9 +261,18 @@ def process(request):
 ## Template authoring
 
 Templates live in `$XDG_DATA_HOME/web-sieve/templates/` (usually
-`~/.local/share/web-sieve/templates/`). Each file is a
-[Minijinja](https://docs.rs/minijinja) template that receives the context dict
-passed to `render_template()`. Templates are hot-reloaded on modification.
+`~/.local/share/web-sieve/templates/`); override the location with
+`--templates-dir`. Each file is a [Minijinja](https://docs.rs/minijinja)
+template that receives the context dict passed to `render_template()`.
+
+Every file is registered under two names — its file name (`base.html`) and its
+stem (`base`) — so `{% extends "base.html" %}` and `render_template("base", …)`
+both resolve. Give templates distinct stems; two files sharing one (`a.html`
+and `a.txt`) collide on the stem entry.
+
+The whole template set is rebuilt whenever a file in the directory is created,
+modified, or removed. Dotfiles and `~` backups are ignored, and a template with
+a syntax error is skipped with a warning while the others keep working.
 
 A minimal template:
 
@@ -290,8 +307,10 @@ common styles in one place.
    a `block_page()`, the other operations are discarded and the browser receives
    a 403.
 5. `enable_reader_mode()` and `render_template()` replace the entire document;
-   subsequent `remove_element()` / `inject_style()` calls operate on the
-   _replaced_ content.
+   `remove_element()` / `inject_style()` / `keep_only()` calls — from any rule,
+   regardless of order — then operate on the _replaced_ content.
+6. If both are queued, `render_template()` wins over `enable_reader_mode()`.
+   When several rules queue a template, the last one in load order is rendered.
 
 ## Tips
 

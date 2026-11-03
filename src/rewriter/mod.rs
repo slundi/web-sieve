@@ -6,6 +6,8 @@ pub use lol_html::errors::RewritingError;
 use lol_html::html_content::{ContentType, Element};
 use lol_html::{ElementContentHandlers, HtmlRewriter, Selector, Settings};
 
+use crate::templates::TemplateEngine;
+
 /// Operations that can be applied to an HTML document.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RewriteOp {
@@ -24,9 +26,79 @@ pub enum RewriteOp {
     /// Block the page entirely; the proxy returns 403 instead of the content.
     /// Handled at the proxy layer — `apply` ignores this variant.
     BlockPage,
+    /// Replace the whole document with a Minijinja template rendered against a
+    /// context object.
+    ///
+    /// `context` holds the JSON encoding of the Starlark dict passed to
+    /// `render_template()`; keeping it as a string means a [`RewriteOp`] stays
+    /// `Send` and comparable while Starlark values are neither.
+    RenderTemplate {
+        /// Template name — file name (`torrent-list.html`) or stem (`torrent-list`).
+        name: String,
+        /// JSON-encoded render context.
+        context: String,
+    },
+}
+
+/// Produce the replacement document for the whole-page ops, if any apply.
+///
+/// `RenderTemplate` takes precedence over `ReaderMode` because it is the more
+/// specific instruction; when several templates are queued the last one wins,
+/// mirroring "last writer wins" for the document as a whole. Any failure
+/// (missing engine, unknown template, bad context, render error) is logged and
+/// leaves the document untouched rather than serving a broken page.
+fn replacement_document(
+    ops: &[RewriteOp],
+    html: &[u8],
+    templates: Option<&TemplateEngine>,
+) -> Option<Vec<u8>> {
+    let last_template = ops.iter().rev().find_map(|op| match op {
+        RewriteOp::RenderTemplate { name, context } => Some((name, context)),
+        _ => None,
+    });
+
+    if let Some((name, context)) = last_template {
+        match templates {
+            None => tracing::warn!(
+                template = %name,
+                "render_template() ignored: no template engine configured"
+            ),
+            Some(engine) => match serde_json::from_str::<serde_json::Value>(context) {
+                Ok(ctx) => match engine.render(name, &ctx) {
+                    Ok(rendered) => return Some(rendered.into_bytes()),
+                    Err(e) => {
+                        tracing::warn!(template = %name, error = %e, "template render failed")
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(template = %name, error = %e, "invalid template context JSON")
+                }
+            },
+        }
+    }
+
+    if ops.iter().any(|o| matches!(o, RewriteOp::ReaderMode)) {
+        let html_str = String::from_utf8_lossy(html);
+        return crate::reader::extract(&html_str).map(|a| crate::reader::render(&a));
+    }
+
+    None
 }
 
 /// Apply a sequence of [`RewriteOp`]s to an HTML document in a single streaming pass.
+///
+/// Equivalent to [`apply_with_templates`] without a template engine:
+/// `RenderTemplate` ops are logged and skipped.
+///
+/// # Errors
+///
+/// Returns [`RewritingError`] if lol-html encounters a fatal parsing error.
+pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> {
+    apply_with_templates(ops, html, None)
+}
+
+/// Apply a sequence of [`RewriteOp`]s, resolving `RenderTemplate` ops against
+/// `templates`.
 ///
 /// Returns the rewritten bytes on success. If `ops` is empty, the input is
 /// returned as-is without any rewriting overhead.
@@ -34,19 +106,19 @@ pub enum RewriteOp {
 /// # Errors
 ///
 /// Returns [`RewritingError`] if lol-html encounters a fatal parsing error.
-pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> {
+pub fn apply_with_templates(
+    ops: &[RewriteOp],
+    html: &[u8],
+    templates: Option<&TemplateEngine>,
+) -> Result<Vec<u8>, RewritingError> {
     if ops.is_empty() {
         return Ok(html.to_vec());
     }
 
-    // Reader mode optionally replaces the entire document.
-    let reader_buf: Option<Vec<u8>> = if ops.iter().any(|o| matches!(o, RewriteOp::ReaderMode)) {
-        let html_str = String::from_utf8_lossy(html);
-        crate::reader::extract(&html_str).map(|a| crate::reader::render(&a))
-    } else {
-        None
-    };
-    let working: &[u8] = reader_buf.as_deref().unwrap_or(html);
+    // Reader mode and template rendering optionally replace the whole document;
+    // the DOM handlers below then run over the replacement.
+    let replaced: Option<Vec<u8>> = replacement_document(ops, html, templates);
+    let working: &[u8] = replaced.as_deref().unwrap_or(html);
 
     // Build lol-html element handlers (skip ReaderMode / Webhook / BlockPage).
     let mut output = Vec::with_capacity(working.len());
@@ -55,7 +127,10 @@ pub fn apply(ops: &[RewriteOp], html: &[u8]) -> Result<Vec<u8>, RewritingError> 
 
     for op in ops {
         match op {
-            RewriteOp::ReaderMode | RewriteOp::Webhook { .. } | RewriteOp::BlockPage => {}
+            RewriteOp::ReaderMode
+            | RewriteOp::Webhook { .. }
+            | RewriteOp::BlockPage
+            | RewriteOp::RenderTemplate { .. } => {}
             RewriteOp::RemoveElement(sel) => {
                 let selector: Selector = match sel.parse() {
                     Ok(s) => s,
@@ -240,6 +315,141 @@ mod tests {
             request.contains(r#"{"event":"test"}"#),
             "missing body: {request}"
         );
+    }
+
+    /// Build a [`TemplateEngine`] over a temp dir containing `files`.
+    ///
+    /// The tempdir is leaked so the engine's watcher keeps a live directory for
+    /// the duration of the test.
+    async fn engine_with(files: &[(&str, &str)]) -> std::sync::Arc<TemplateEngine> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).expect("write template");
+        }
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        TemplateEngine::new(path).await.expect("template engine")
+    }
+
+    #[tokio::test]
+    async fn test_render_template_replaces_document() {
+        let templates = engine_with(&[("page.html", "<main>{{ title }}</main>")]).await;
+        let ops = vec![RewriteOp::RenderTemplate {
+            name: "page".to_string(),
+            context: r#"{"title":"Hello"}"#.to_string(),
+        }];
+        let result = apply_with_templates(
+            &ops,
+            b"<html><body>original</body></html>",
+            Some(&templates),
+        )
+        .expect("apply");
+        let output = String::from_utf8(result).expect("utf8");
+        assert_eq!(output, "<main>Hello</main>");
+    }
+
+    #[tokio::test]
+    async fn test_render_template_then_dom_ops_run_on_replacement() {
+        let templates = engine_with(&[(
+            "page.html",
+            "<html><head></head><body><div class=\"x\">drop</div><p>keep</p></body></html>",
+        )])
+        .await;
+        let ops = vec![
+            RewriteOp::RenderTemplate {
+                name: "page".to_string(),
+                context: "{}".to_string(),
+            },
+            RewriteOp::RemoveElement("div.x".to_string()),
+        ];
+        let result = apply_with_templates(
+            &ops,
+            b"<html><body>original</body></html>",
+            Some(&templates),
+        )
+        .expect("apply");
+        let output = String::from_utf8(result).expect("utf8");
+        assert!(
+            !output.contains("drop"),
+            "DOM op should run on the template output: {output}"
+        );
+        assert!(
+            output.contains("<p>keep</p>"),
+            "rest of template must survive: {output}"
+        );
+        assert!(
+            !output.contains("original"),
+            "original document must be gone: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_render_template_takes_precedence_over_reader_mode() {
+        let templates = engine_with(&[("page.html", "TEMPLATE")]).await;
+        let ops = vec![
+            RewriteOp::ReaderMode,
+            RewriteOp::RenderTemplate {
+                name: "page".to_string(),
+                context: "{}".to_string(),
+            },
+        ];
+        let html = b"<html><head><title>T</title></head><body><article><p>\
+        A long article body with plenty of text so the readability engine would \
+        happily select it as the main content candidate for the page.</p></article></body></html>";
+        let result = apply_with_templates(&ops, html, Some(&templates)).expect("apply");
+        assert_eq!(String::from_utf8(result).expect("utf8"), "TEMPLATE");
+    }
+
+    #[tokio::test]
+    async fn test_render_template_last_op_wins() {
+        let templates = engine_with(&[("a.html", "AAA"), ("b.html", "BBB")]).await;
+        let ops = vec![
+            RewriteOp::RenderTemplate {
+                name: "a".to_string(),
+                context: "{}".to_string(),
+            },
+            RewriteOp::RenderTemplate {
+                name: "b".to_string(),
+                context: "{}".to_string(),
+            },
+        ];
+        let result = apply_with_templates(&ops, b"<html></html>", Some(&templates)).expect("apply");
+        assert_eq!(String::from_utf8(result).expect("utf8"), "BBB");
+    }
+
+    #[tokio::test]
+    async fn test_render_template_unknown_name_leaves_document_untouched() {
+        let templates = engine_with(&[]).await;
+        let html = b"<html><body>original</body></html>";
+        let ops = vec![RewriteOp::RenderTemplate {
+            name: "missing".to_string(),
+            context: "{}".to_string(),
+        }];
+        let result = apply_with_templates(&ops, html, Some(&templates)).expect("apply");
+        assert_eq!(result, html, "unknown template must not alter the page");
+    }
+
+    #[test]
+    fn test_render_template_without_engine_is_noop() {
+        let html = b"<html><body>original</body></html>";
+        let ops = vec![RewriteOp::RenderTemplate {
+            name: "page".to_string(),
+            context: "{}".to_string(),
+        }];
+        let result = apply(&ops, html).expect("apply");
+        assert_eq!(result, html, "no engine configured → document unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_render_template_invalid_context_json_is_noop() {
+        let templates = engine_with(&[("page.html", "TEMPLATE")]).await;
+        let html = b"<html><body>original</body></html>";
+        let ops = vec![RewriteOp::RenderTemplate {
+            name: "page".to_string(),
+            context: "{not json".to_string(),
+        }];
+        let result = apply_with_templates(&ops, html, Some(&templates)).expect("apply");
+        assert_eq!(result, html, "undecodable context must not alter the page");
     }
 
     #[test]

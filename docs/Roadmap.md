@@ -202,13 +202,25 @@
 - CONNECT requests inside the MITM'd stream (nested MITM, extended-CONNECT
   for WebSockets-over-h2, MASQUE, …) are answered with `501 Not Implemented`.
 
-### Step 6.4 — Minijinja Template Engine
+### Step 6.4 — Minijinja Template Engine ✅
 
 - Users author display templates in the XDG data directory under `templates/` using `minijinja`.
+  Default `~/.local/share/web-sieve/templates/`, overridable with `--templates-dir`.
 - Covers re-rendered views: torrent/download list, weather forecast, news feed, manga/webnovel reader, git repository.
-- Starlark scripts call `render_template(name, context_dict)` binding; Rust resolves the template name and renders via `minijinja`.
-- Templates are shared: multiple Starlark scripts may reference the same template by name.
-- Extend the existing `notify` file watcher to hot-reload templates on modification.
+- Starlark scripts call `render_template(name, context_dict)`; the binding JSON-encodes
+  the dict into a `RewriteOp::RenderTemplate`, and `rewriter::apply_with_templates`
+  resolves the name against the `TemplateEngine` and renders via `minijinja`.
+- Each file is registered under both its file name (`base.html`) and its stem
+  (`base`), so `{% extends "base.html" %}` and `render_template("base", …)` both
+  resolve. Templates are shared: multiple Starlark scripts may reference the same
+  one by name.
+- `RenderTemplate` replaces the whole document and takes precedence over
+  `ReaderMode`; the last queued template wins. Remaining DOM ops
+  (`remove_element()`, `inject_style()`, …) then run over the rendered output.
+- Any failure — unknown template, syntax error, bad context — is logged and the
+  upstream page is served unchanged rather than a broken document.
+- A dedicated `notify` watcher on the templates directory rebuilds the whole
+  template set on create/modify/remove.
 
 ### Step 6.5 — Static Asset Serving & Local Proxy Endpoint
 
