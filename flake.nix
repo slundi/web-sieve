@@ -11,43 +11,49 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    flake-utils,
-    rust-overlay,
-  }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      rust-overlay,
+    }:
     flake-utils.lib.eachDefaultSystem (
-      system: let
-        overlays = [(import rust-overlay)];
-        pkgs = import nixpkgs {inherit system overlays;};
+      system:
+      let
+        overlays = [ (import rust-overlay) ];
+        pkgs = import nixpkgs { inherit system overlays; };
         marketplaceExtensions = map pkgs.vscode-utils.buildVscodeMarketplaceExtension [
+          # NOTE: the hash belongs *inside* `mktplcRef` — that attrset is what is
+          # forwarded to `fetchurl`. A top-level `sha256` is silently ignored and
+          # the fetch falls back to the fake all-zeros hash.
           {
             mktplcRef = {
               publisher = "ryanluker";
               name = "vscode-coverage-gutters";
               version = "2.14.0";
+              hash = "sha256-waF3FmncUsXqWFWGRy9X7RQ29BDRYlaqyFhEXg4HXNo=";
             };
-            sha256 = "sha256-kCJK+Hq08cl0OqJbDOI8nvdDFUiuTolr+Rqrc86OqRo=";
           }
           {
             mktplcRef = {
               publisher = "swellaby";
               name = "vscode-rust-test-adapter";
               version = "0.11.0";
+              hash = "sha256-IgfcIRF54JXm9l2vVjf7lFJOVSI0CDgDjQT+Hw6FO4Q=";
             };
-            sha256 = "sha256-BHcShZ3h4OvSQT+0jQSuQIOCfAMc26bxVJPXloAY3Z8=";
           }
           {
             mktplcRef = {
               publisher = "nefrob";
               name = "vscode-just-syntax";
               version = "0.10.1";
+              hash = "sha256-s/JxIALrYb/dew1CdvvM1UmnewyRcJPB/ETJ/Ai2QJA=";
             };
-            sha256 = "sha256-Eyye+kFdDI2SWtUdyR36QvZ9YVkvRma5aPqDxMfSZKw=";
           }
         ];
-        extensions = with pkgs.vscode-extensions;
+        extensions =
+          with pkgs.vscode-extensions;
           [
             rust-lang.rust-analyzer
             tamasfe.even-better-toml
@@ -63,7 +69,8 @@
 
         # Read project metadata from Cargo.toml for reuse below
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-      in {
+      in
+      {
         # `nix build` and `nix run` — builds the release binary
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = cargoToml.package.name;
@@ -92,7 +99,7 @@
             git-cliff # Changelog generator from conventional commits
             mold # Fast linker (referenced in .cargo/config.toml)
             dprint # Formatter for JSON, TOML, Markdown
-            nixfmt-rfc-style # Nix formatter (RFC 166)
+            nixfmt # Nix formatter (RFC 166)
             yamlfmt # YAML formatter
             nil # Nix language server (referenced in .vscode/settings.json)
           ];
